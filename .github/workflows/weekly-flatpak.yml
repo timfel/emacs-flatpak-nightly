@@ -31,7 +31,7 @@ jobs:
       - name: Tangle the Flatpak build files
         run: |
           emacs --batch --eval '(require (quote org))' \
-            --eval '(org-babel-tangle-file "emacs-build.org")'
+            --eval '(org-babel-tangle-file "README.org")'
 
       - name: Build the Flatpak builder image
         run: podman build --tag emacs-flatpak-builder .
