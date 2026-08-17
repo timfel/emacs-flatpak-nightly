@@ -1,0 +1,314 @@
+#+TITLE: Wayland Emacs master Flatpak
+#+AUTHOR: Containerized Build Pipeline
+#+PROPERTY: header-args:bash :eval never
+#+PROPERTY: header-args:dockerfile :tangle Containerfile
+#+PROPERTY: header-args:yaml :tangle org.gnu.emacs.yaml
+
+* Overview
+
+This builds Emacs ~master~ as a PGTK (native Wayland) Flatpak.  It enables
+native compilation, tree-sitter, its built-in JSON parser, ImageMagick,
+XWidgets, D-Bus, dynamic modules, file notifications, sound, SVG, XPM, and
+image libraries provided by the GNOME runtime.
+
+There are two separate environments:
+
+- The *builder container* needs only Flatpak tooling and Git.  Its Fedora DNF
+  packages are not inputs to Emacs and must not be used to satisfy Emacs build
+  dependencies.
+- The *Flatpak build sandbox* is the GNOME SDK plus the modules below.  Runtime
+  libraries already supplied by the GNOME Platform are used from the SDK;
+  libraries not in it (tree-sitter, ImageMagick, libXpm, and libgccjit) are
+  explicitly built into ~/app~.  Emacs 30 and later include their own JSON
+  parser, so Jansson is deliberately not bundled.
+
+~master~ deliberately follows a moving Git branch, so this is a rolling build,
+not a bit-for-bit reproducible release.  All non-Emacs third-party sources are
+pinned to immutable commits or checksummed archives.
+
+* Configuration Files
+
+** Builder Containerfile
+
+#+begin_src dockerfile :tangle Containerfile
+FROM fedora:44
+
+# These are host-side tools only.  Emacs and its dependencies build in the
+# org.gnome.Sdk sandbox selected by the manifest, never against Fedora.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        ca-certificates \
+        flatpak \
+        flatpak-builder \
+        git \
+        git-lfs \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Keep the SDK in the image so a container run does not have to download it.
+RUN flatpak remote-add --if-not-exists flathub \
+        https://dl.flathub.org/repo/flathub.flatpakrepo \
+    && flatpak install -y --system flathub \
+        org.gnome.Sdk//49 \
+        org.gnome.Platform//49
+
+WORKDIR /build
+#+end_src
+
+** Flatpak Manifest
+
+#+begin_src yaml :tangle org.gnu.emacs.yaml
+app-id: org.gnu.emacs
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+# Start through a wrapper so M-x term and M-x shell default to the host shell.
+command: emacs-host
+rename-appdata-file: emacs.metainfo.xml
+rename-desktop-file: emacs.desktop
+rename-icon: emacs
+
+# This is intentionally an unsandboxed-for-a-Flatpak developer editor.  It can
+# read and modify the host, use host devices and the complete host D-Bus, and
+# can launch host commands with `flatpak-spawn --host`.  Do not publish this
+# manifest to Flathub or install it for untrusted Emacs configurations.
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --socket=ssh-auth
+  - --socket=session-bus
+  - --socket=system-bus
+  - --talk-name=org.freedesktop.Flatpak
+  - --filesystem=host
+  - --filesystem=/tmp
+  - --filesystem=/var/tmp
+  - --filesystem=xdg-run/gvfs
+  - --device=all
+  - --allow=devel
+
+modules:
+  # The GNOME SDK already supplies GTK3/Pango/Cairo, Wayland, WebKitGTK,
+  # GnuTLS, SQLite, libxml2, librsvg, JPEG/PNG/TIFF/WebP, ALSA/PulseAudio,
+  # D-Bus, systemd, HarfBuzz, FreeType, Fontconfig, zlib, and build tools.
+  # Build only libraries absent from that SDK.  Emacs 30 has an in-tree JSON
+  # parser, so it does not use libjansson.
+  - name: tree-sitter
+    buildsystem: simple
+    build-commands:
+      - make PREFIX=${FLATPAK_DEST} -j${FLATPAK_BUILDER_N_JOBS}
+      - make install PREFIX=${FLATPAK_DEST}
+    sources:
+      - type: git
+        url: https://github.com/tree-sitter/tree-sitter.git
+        commit: da6fe9beb4f7f67beb75914ca8e0d48ae48d6406
+
+  - name: libxpm
+    buildsystem: autotools
+    sources:
+      - type: archive
+        url: https://www.x.org/releases/individual/lib/libXpm-3.5.17.tar.xz
+        sha256: 64b31f81019e7d388c822b0b28af8d51c4622b83f1f0cb6fa3fc95e271226e43
+
+  - name: imagemagick
+    buildsystem: autotools
+    config-opts:
+      - --disable-static
+      - --without-perl
+      - --without-x
+    sources:
+      - type: git
+        url: https://github.com/ImageMagick/ImageMagick.git
+        commit: 360eda553586e389c9c725fc49df94f209a8a3c7
+
+  # org.gnome.Sdk contains GCC but not libgccjit.  Build a JIT-focused GCC
+  # configuration and its static arithmetic prerequisites in /app.
+  - name: libgccjit
+    buildsystem: autotools
+    builddir: true
+    build-options:
+      env:
+        # GCC 15 defaults to C23; GCC 14's build scripts need GNU C17.
+        CFLAGS: -std=gnu17
+    config-opts:
+      - --with-linker-hash-style=gnu
+      - --enable-checking=release
+      - --enable-host-shared
+      - --enable-languages=jit
+      - --disable-bootstrap
+      - --disable-gcov
+      - --disable-libada
+      - --disable-libgomp
+      - --disable-libquadmath
+      - --disable-libsanitizer
+      - --disable-libssp
+      - --disable-libstdcxx
+      - --disable-libvtv
+      - --disable-lto
+      - --disable-multilib
+    cleanup:
+      - /include
+      - /lib/debug
+      - /libexec
+      - /share
+      # libgccjit needs libgcc.a when compiling Lisp at runtime.
+      - '*.la'
+    modules:
+      - name: gmp
+        buildsystem: autotools
+        config-opts:
+          - --enable-static
+          - --disable-shared
+          - CFLAGS=-fPIC -std=gnu17
+        sources:
+          - type: archive
+            url: https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
+            sha256: a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898
+        cleanup:
+          - '*'
+      - name: mpfr
+        buildsystem: autotools
+        config-opts:
+          - --enable-static
+          - --disable-shared
+          - CFLAGS=-fPIC -std=gnu17
+        sources:
+          - type: archive
+            url: https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz
+            sha256: 277807353a6726978996945af13e52829e3abd7a9a5b7fb2793894e18f1fcbb2
+        cleanup:
+          - '*'
+      - name: mpc
+        buildsystem: autotools
+        config-opts:
+          - --enable-static
+          - --disable-shared
+          - CFLAGS=-fPIC -std=gnu17
+        sources:
+          - type: archive
+            url: https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
+            sha256: ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8
+        cleanup:
+          - '*'
+    sources:
+      - type: archive
+        url: https://ftp.gnu.org/gnu/gcc/gcc-14.3.0/gcc-14.3.0.tar.xz
+        sha256: e0dc77297625631ac8e50fa92fffefe899a4eb702592da5c32ef04e2293aca3a
+
+  - name: emacs
+    buildsystem: autotools
+    # Flatpak accepts the SVG and PNG icons but not Emacs's legacy ICO export.
+    cleanup:
+      - /share/icons/hicolor/scalable/apps/emacs.ico
+    build-options:
+      env:
+        CC: /usr/bin/gcc
+    config-opts:
+      - --with-pgtk
+      - --with-native-compilation=aot
+      - --with-tree-sitter
+      - --with-imagemagick
+      - --with-dbus
+      - --with-file-notification=inotify
+      - --with-xwidgets
+      - --with-modules
+      - --with-rsvg
+      - --with-xpm
+      - --with-sound=alsa
+    sources:
+      # The GitHub mirror is substantially more reliable for Flatpak Builder's
+      # source fetch; it mirrors the upstream Savannah master branch.
+      - type: git
+        url: https://github.com/emacs-mirror/emacs.git
+        branch: master
+      # A repository checkout has no configure script.
+      - type: shell
+        commands:
+          - ./autogen.sh
+
+  # Make Emacs's interactive terminal and shell modes start the user's host
+  # shell by default.  User init files can still override these variables.
+  - name: host-shell-default
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 emacs-host ${FLATPAK_DEST}/bin/emacs-host
+      - install -Dm755 host-shell ${FLATPAK_DEST}/bin/host-shell
+      - install -Dm644 site-start.el ${FLATPAK_DEST}/share/emacs/site-lisp/site-start.el
+    sources:
+      - type: inline
+        dest-filename: emacs-host
+        contents: |
+          #!/bin/sh
+          export EMACS_HOST_SHELL="${SHELL:-/bin/sh}"
+          export SHELL=/app/bin/host-shell
+          exec /app/bin/emacs "$@"
+      - type: inline
+        dest-filename: host-shell
+        contents: |
+          #!/bin/sh
+          exec flatpak-spawn --host "${EMACS_HOST_SHELL:-/bin/sh}" "$@"
+      - type: inline
+        dest-filename: site-start.el
+        contents: |
+          ;; Use the host shell only for interactive shell and terminal modes.
+          ;; Other Emacs subprocess APIs intentionally stay in the Flatpak.
+          (setq shell-file-name "/app/bin/host-shell"
+                explicit-shell-file-name "/app/bin/host-shell")
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/doc
+  - /share/man
+#+end_src
+
+* Build and Install
+
+1. Tangle the generated files:
+   #+begin_src bash
+   emacs --batch --eval '(require (quote org))' \
+         --eval '(org-babel-tangle-file "emacs-build.org")'
+   #+end_src
+2. Build the tool image.  The initial build downloads the GNOME 49 SDK and
+   Platform into the image:
+   #+begin_src bash
+   podman build -t emacs-flatpak-builder .
+   #+end_src
+3. Build a local Flatpak repository.  ~--privileged~ is needed because
+   Flatpak's build sandbox uses namespaces inside the rootless Podman
+   container; it is not an Emacs runtime permission.
+   #+begin_src bash
+   podman run --rm -it --privileged \
+          -v "$PWD:/build:Z" \
+          emacs-flatpak-builder \
+          flatpak-builder --force-clean --repo=repo build-dir org.gnu.emacs.yaml
+   #+end_src
+4. Create a distributable single-file application bundle.  It contains Emacs
+   and every module installed in ~/app~; the shared GNOME runtime remains a
+   separate Flatpak ref and will be obtained from Flathub on the recipient's
+   first installation.
+   #+begin_src bash
+   flatpak build-bundle \
+           --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+           repo org.gnu.emacs.flatpak org.gnu.emacs
+   sha256sum org.gnu.emacs.flatpak > org.gnu.emacs.flatpak.sha256
+   #+end_src
+   Recipients install that one file with:
+   #+begin_src bash
+   flatpak --user install --bundle --reinstall org.gnu.emacs.flatpak
+   #+end_src
+   For an entirely offline distribution, distribute the GNOME 49 runtime ref
+   alongside the bundle, or distribute the ~repo/~ directory instead; a
+   Flatpak bundle cannot embed a runtime ref.
+5. Alternatively, install from the local repository on the *host* (the old
+   ~--user~ invocation installed only into the disposable container):
+   #+begin_src bash
+   flatpak --user remote-add --if-not-exists --no-gpg-verify \
+           emacs-local "file://$PWD/repo"
+   flatpak --user install --reinstall emacs-local org.gnu.emacs
+   #+end_src
+
+Run it with ~flatpak run org.gnu.emacs~.  ~M-x shell~ and ~M-x term~ use the
+host shell through ~flatpak-spawn --host~.  Other Emacs subprocess APIs remain
+inside the Flatpak runtime; user init can override the shell policy.
