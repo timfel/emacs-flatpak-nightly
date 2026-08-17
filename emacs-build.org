@@ -312,3 +312,12 @@ cleanup:
 Run it with ~flatpak run org.gnu.emacs~.  ~M-x shell~ and ~M-x term~ use the
 host shell through ~flatpak-spawn --host~.  Other Emacs subprocess APIs remain
 inside the Flatpak runtime; user init can override the shell policy.
+
+* Continuous Integration
+
+~.github/workflows/weekly-flatpak.yml~ builds this rolling ~master~ configuration
+every Sunday at 03:17 UTC and can also be run manually from the Actions tab.  It
+uploads ~org.gnu.emacs.flatpak~ and its SHA-256 file as the
+~emacs-flatpak-bundle~ artifact, then deletes older artifacts with that name.
+GitHub wraps downloaded Actions artifacts in a ZIP; extract it before running
+the documented ~flatpak install --bundle~ command.
