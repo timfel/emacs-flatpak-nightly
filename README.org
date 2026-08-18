@@ -235,8 +235,10 @@ exec -a emacsclient $PWD/Emacs.AppImage -c
 * Desktop metadata
 
 The desktop file is copied to the AppDir root alongside Emacs's own scalable
-icon.  Desktop integration tools may replace the executable field with the
-installed AppImage path.
+icon.  During dependency deployment its ~Exec~ field temporarily names the
+bundled ~emacs~ executable, because linuxdeploy resolves the command while
+processing the desktop file.  The build changes it back to ~Emacs.AppImage~
+after linuxdeploy has finished, so desktop integration launches this artifact.
 
 #+begin_src conf :tangle Emacs.desktop
 [Desktop Entry]
@@ -244,7 +246,7 @@ Type=Application
 Name=Emacs
 GenericName=Text Editor
 Comment=Edit text with Emacs
-Exec=Emacs.AppImage %F
+Exec=emacs %F
 Icon=Emacs
 Terminal=false
 Categories=Development;TextEditor;
@@ -406,6 +408,16 @@ NO_STRIP=1 linuxdeploy \
   --icon-file "$APPDIR/Emacs.svg" \
   "${webkit_deploy_args[@]}" \
   --plugin gtk
+#+end_src
+
+Now linuxdeploy has finished resolving Exec=emacs and we can restore the
+command intended for the installed AppImage desktop entry. The root desktop
+file is a symlink to this copy after deployment, so both locations stay
+consistent.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+desktop_file="$APPDIR/usr/share/applications/Emacs.desktop"
+sed -i 's/^Exec=emacs %F$/Exec=Emacs.AppImage %F/' "$desktop_file"
 #+end_src
 
 The last step is to compile our custom launcher, add it as ~AppRun~, and build
