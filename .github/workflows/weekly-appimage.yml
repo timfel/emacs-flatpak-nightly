@@ -1,0 +1,77 @@
+name: Weekly Emacs AppImage
+
+on:
+  schedule:
+    - cron: '17 03 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: weekly-emacs-appimage
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tangle the build files
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends emacs-nox
+          emacs --batch --quick --eval '(require (quote org))' \
+            --eval '(org-babel-tangle-file "README.org")'
+
+      - name: Build builder image
+        run: docker build --tag emacs-appimage-builder -f Containerfile .
+
+      - name: Build Emacs.AppImage
+        run: |
+          rm -rf .build AppDir dist
+          docker run --rm -v "$PWD:/work" emacs-appimage-builder
+
+      - name: Smoke test the launcher names
+        run: |
+          APPIMAGE_EXTRACT_AND_RUN=1 dist/Emacs.AppImage --batch --quick \
+            --eval '(princ emacs-version)'
+          ln -s Emacs.AppImage dist/emacsclient
+          APPIMAGE_EXTRACT_AND_RUN=1 dist/emacsclient --version
+
+      - name: Upload latest AppImage
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: emacs-appimage
+          path: |
+            dist/Emacs.AppImage
+            dist/Emacs.AppImage.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Remove superseded artifacts
+        uses: actions/github-script@v7
+        env:
+          KEEP_ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        with:
+          script: |
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              { owner: context.repo.owner, repo: context.repo.repo,
+                name: "emacs-appimage", per_page: 100 },
+            );
+            for (const artifact of artifacts) {
+              if (String(artifact.id) !== process.env.KEEP_ARTIFACT_ID) {
+                core.info(`Deleting superseded artifact ${artifact.id}`);
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+              }
+            }
