@@ -1,0 +1,13 @@
+# Files generated from README.org.
+Containerfile
+Emacs.desktop
+build-appimage.sh
+AppRun.c
+
+# Build trees and artifacts.
+.build/
+dist/
+AppDir/
+*.AppImage
+*.AppImage.zsync
+*.sha256

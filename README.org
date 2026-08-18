@@ -1,323 +1,457 @@
-#+TITLE: Wayland Emacs master Flatpak
+#+TITLE: A full-featured Wayland Emacs AppImage
 #+AUTHOR: Containerized Build Pipeline
-#+PROPERTY: header-args:bash :eval never
-#+PROPERTY: header-args:dockerfile :tangle Containerfile
-#+PROPERTY: header-args:yaml :tangle org.gnu.emacs.yaml
+#+PROPERTY: header-args :eval never
 
 * Overview
 
-This builds Emacs ~master~ as a PGTK (native Wayland) Flatpak.  It enables
-native compilation, tree-sitter, its built-in JSON parser, ImageMagick,
-XWidgets, D-Bus, dynamic modules, file notifications, sound, SVG, XPM, and
-image libraries provided by the GNOME runtime.
+This document is both the explanation and the complete source for building
+Emacs ~master~ as a PGTK (native Wayland) AppImage for x86-64 Linux.  The build
+enables native compilation, tree-sitter, the built-arser,
+ImageMagick, XWidgets, D-Bus, dynamic modules, file notifications, sound, SVG,
+XPM, and the usual image formats.
 
-There are two separate environments:
+An AppImage is an ordinary, unsandboxed process.  Emacs can use the host
+filesystem, D-Bus session, devices, environment, and commands directly.  The
+artifact contains Emacs and its non-core runtime dependencies, but uses the
+host kernel, display server, and other fundamental system facilities.
 
-- The *builder container* needs only Flatpak tooling and Git.  Its Fedora DNF
-  packages are not inputs to Emacs and must not be used to satisfy Emacs build
-  dependencies.
-- The *Flatpak build sandbox* is the GNOME SDK plus the modules below.  Runtime
-  libraries already supplied by the GNOME Platform are used from the SDK;
-  libraries not in it (tree-sitter, ImageMagick, libXpm, and libgccjit) are
-  explicitly built into ~/app~.  Emacs 30 and later include their own JSON
-  parser, so Jansson is deliberately not bundled.
+The compilation environment is Ubuntu 22.04, which gives the result a
+reasonably old glibc baseline.  ~linuxdeploy~ gathers ELF dependencies and its
+GTK plugin installs GTK, GIO, icon, schema, and loader data.  WebKit helper
+processes and injected bundles are included explicitly because they are loaded
+at runtime and do not all appear in Emacs's ELF dependency list.
 
-~master~ deliberately follows a moving Git branch, so this is a rolling build,
-not a bit-for-bit reproducible release.  All non-Emacs third-party sources are
-pinned to immutable commits or checksummed archives.
+Emacs follows a moving Git branch by default, so this is a rolling build rather
+than a bit-for-bit reproducible release.  ~EMACS_REF~ can select a branch, tag,
+or commit when a fixed input is desired.
 
-* Configuration Files
+* Tangle the build
 
-** Builder Containerfile
+Every project file is contained below.  From the repository root, create or
+refresh them with:
+
+#+begin_src sh
+emacs --batch --quick --eval '(require (quote org))' \
+  --eval '(org-babel-tangle-file "README.org")'
+#+end_src
+
+The generated files are ignored by Git; this Org document and the workflow are
+the maintained sources.
+
+* Builder container
+
+The container supplies compilation headers and tools. Runtime libraries are
+subsequently selected from this old userspace and copied into the AppDir.
 
 #+begin_src dockerfile :tangle Containerfile
-FROM fedora:44
+  FROM ubuntu:22.04
 
-# These are host-side tools only.  Emacs and its dependencies build in the
-# org.gnome.Sdk sandbox selected by the manifest, never against Fedora.
-RUN dnf install -y --setopt=install_weak_deps=False \
-        ca-certificates \
-        flatpak \
-        flatpak-builder \
-        git \
-        git-lfs \
-    && dnf clean all \
-    && rm -rf /var/cache/dnf
+  ENV DEBIAN_FRONTEND=noninteractive
 
-# Keep the SDK in the image so a container run does not have to download it.
-RUN flatpak remote-add --if-not-exists flathub \
-        https://dl.flathub.org/repo/flathub.flatpakrepo \
-    && flatpak install -y --system flathub \
-        org.gnome.Sdk//49 \
-        org.gnome.Platform//49
+  # Build on an older userspace so the resulting AppImage works on newer Linux
+  # distributions as well.  These packages are build inputs only; linuxdeploy
+  # copies the required runtime libraries into the AppDir.
+  RUN apt-get update && apt-get install -y --no-install-recommends \
+        autoconf automake build-essential ca-certificates curl file git \
+        libacl1-dev libasound2-dev libdbus-1-dev libgif-dev libgnutls28-dev \
+        libgpm-dev libgtk-3-dev libharfbuzz-dev libjpeg-dev \
+        libmagickwand-dev libncurses-dev libotf-dev libpng-dev librsvg2-dev \
+        libselinux1-dev libsqlite3-dev libsystemd-dev libtiff-dev \
+        libtree-sitter-dev libwebkit2gtk-4.0-dev libwebp-dev libxpm-dev \
+        libxml2-dev libgccjit-11-dev gcc-11 g++-11 make pkg-config texinfo \
+      && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /build
+  WORKDIR /work
+  ENTRYPOINT ["/work/build-appimage.sh"]
 #+end_src
 
-** Flatpak Manifest
+* AppImage launcher
 
-#+begin_src yaml :tangle org.gnu.emacs.yaml
-app-id: org.gnu.emacs
-runtime: org.gnome.Platform
-runtime-version: '49'
-sdk: org.gnome.Sdk
-# Start through a wrapper so M-x term and M-x shell default to the host shell.
-command: emacs-host
-rename-appdata-file: emacs.metainfo.xml
-rename-desktop-file: emacs.desktop
-rename-icon: emacs
+A shell ~AppRun~ would lose useful control over ~argv[0]~ while passing through
+its interpreter. Instead, we use a small C launcher.
 
-# This is intentionally an unsandboxed-for-a-Flatpak developer editor.  It can
-# read and modify the host, use host devices and the complete host D-Bus, and
-# can launch host commands with `flatpak-spawn --host`.  Do not publish this
-# manifest to Flathub or install it for untrusted Emacs configurations.
-finish-args:
-  - --share=ipc
-  - --share=network
-  - --socket=wayland
-  - --socket=fallback-x11
-  - --socket=pulseaudio
-  - --socket=ssh-auth
-  - --socket=session-bus
-  - --socket=system-bus
-  - --talk-name=org.freedesktop.Flatpak
-  - --filesystem=host
-  - --filesystem=/tmp
-  - --filesystem=/var/tmp
-  - --filesystem=xdg-run/gvfs
-  - --device=all
-  - --allow=devel
+#+begin_src c :tangle AppRun.c
+#define _GNU_SOURCE
 
-modules:
-  # The GNOME SDK already supplies GTK3/Pango/Cairo, Wayland, WebKitGTK,
-  # GnuTLS, SQLite, libxml2, librsvg, JPEG/PNG/TIFF/WebP, ALSA/PulseAudio,
-  # D-Bus, systemd, HarfBuzz, FreeType, Fontconfig, zlib, and build tools.
-  # Build only libraries absent from that SDK.  Emacs 30 has an in-tree JSON
-  # parser, so it does not use libjansson.
-  - name: tree-sitter
-    buildsystem: simple
-    build-commands:
-      - make PREFIX=${FLATPAK_DEST} -j${FLATPAK_BUILDER_N_JOBS}
-      - make install PREFIX=${FLATPAK_DEST}
-    sources:
-      - type: git
-        url: https://github.com/tree-sitter/tree-sitter.git
-        commit: da6fe9beb4f7f67beb75914ca8e0d48ae48d6406
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
-  - name: libxpm
-    buildsystem: autotools
-    sources:
-      - type: archive
-        url: https://www.x.org/releases/individual/lib/libXpm-3.5.17.tar.xz
-        sha256: 64b31f81019e7d388c822b0b28af8d51c4622b83f1f0cb6fa3fc95e271226e43
+#ifndef EMACS_VERSION
+#error "EMACS_VERSION must be supplied by the build"
+#endif
+#ifndef EMACS_ARCH
+#error "EMACS_ARCH must be supplied by the build"
+#endif
+#ifndef SYSTEM_ARCH
+#error "SYSTEM_ARCH must be supplied by the build"
+#endif
 
-  - name: imagemagick
-    buildsystem: autotools
-    config-opts:
-      - --disable-static
-      - --without-perl
-      - --without-x
-    sources:
-      - type: git
-        url: https://github.com/ImageMagick/ImageMagick.git
-        commit: 360eda553586e389c9c725fc49df94f209a8a3c7
-
-  # org.gnome.Sdk contains GCC but not libgccjit.  Build a JIT-focused GCC
-  # configuration and its static arithmetic prerequisites in /app.
-  - name: libgccjit
-    buildsystem: autotools
-    builddir: true
-    build-options:
-      env:
-        # GCC 15 defaults to C23; GCC 14's build scripts need GNU C17.
-        CFLAGS: -std=gnu17
-    config-opts:
-      - --with-linker-hash-style=gnu
-      - --enable-checking=release
-      - --enable-host-shared
-      - --enable-languages=jit
-      - --disable-bootstrap
-      - --disable-gcov
-      - --disable-libada
-      - --disable-libgomp
-      - --disable-libquadmath
-      - --disable-libsanitizer
-      - --disable-libssp
-      - --disable-libstdcxx
-      - --disable-libvtv
-      - --disable-lto
-      - --disable-multilib
-    cleanup:
-      - /include
-      - /lib/debug
-      - /libexec
-      - /share
-      # libgccjit needs libgcc.a when compiling Lisp at runtime.
-      - '*.la'
-    modules:
-      - name: gmp
-        buildsystem: autotools
-        config-opts:
-          - --enable-static
-          - --disable-shared
-          - CFLAGS=-fPIC -std=gnu17
-        sources:
-          - type: archive
-            url: https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
-            sha256: a3c2b80201b89e68616f4ad30bc66aee4927c3ce50e33929ca819d5c43538898
-        cleanup:
-          - '*'
-      - name: mpfr
-        buildsystem: autotools
-        config-opts:
-          - --enable-static
-          - --disable-shared
-          - CFLAGS=-fPIC -std=gnu17
-        sources:
-          - type: archive
-            url: https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz
-            sha256: 277807353a6726978996945af13e52829e3abd7a9a5b7fb2793894e18f1fcbb2
-        cleanup:
-          - '*'
-      - name: mpc
-        buildsystem: autotools
-        config-opts:
-          - --enable-static
-          - --disable-shared
-          - CFLAGS=-fPIC -std=gnu17
-        sources:
-          - type: archive
-            url: https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
-            sha256: ab642492f5cf882b74aa0cb730cd410a81edcdbec895183ce930e706c1c759b8
-        cleanup:
-          - '*'
-    sources:
-      - type: archive
-        url: https://ftp.gnu.org/gnu/gcc/gcc-14.3.0/gcc-14.3.0.tar.xz
-        sha256: e0dc77297625631ac8e50fa92fffefe899a4eb702592da5c32ef04e2293aca3a
-
-  - name: emacs
-    buildsystem: autotools
-    # Flatpak accepts the SVG and PNG icons but not Emacs's legacy ICO export.
-    cleanup:
-      - /share/icons/hicolor/scalable/apps/emacs.ico
-    build-options:
-      env:
-        CC: /usr/bin/gcc
-    config-opts:
-      - --with-pgtk
-      - --with-native-compilation=aot
-      - --with-tree-sitter
-      - --with-imagemagick
-      - --with-dbus
-      - --with-file-notification=inotify
-      - --with-xwidgets
-      - --with-modules
-      - --with-rsvg
-      - --with-xpm
-      - --with-sound=alsa
-    sources:
-      # The GitHub mirror is substantially more reliable for Flatpak Builder's
-      # source fetch; it mirrors the upstream Savannah master branch.
-      - type: git
-        url: https://github.com/emacs-mirror/emacs.git
-        branch: master
-      # A repository checkout has no configure script.
-      - type: shell
-        commands:
-          - ./autogen.sh
-
-  # Make Emacs's interactive terminal and shell modes start the user's host
-  # shell by default.  User init files can still override these variables.
-  - name: host-shell-default
-    buildsystem: simple
-    build-commands:
-      - install -Dm755 emacs-host ${FLATPAK_DEST}/bin/emacs-host
-      - install -Dm755 host-shell ${FLATPAK_DEST}/bin/host-shell
-      - install -Dm644 site-start.el ${FLATPAK_DEST}/share/emacs/site-lisp/site-start.el
-    sources:
-      - type: inline
-        dest-filename: emacs-host
-        contents: |
-          #!/bin/sh
-          export EMACS_HOST_SHELL="${SHELL:-/bin/sh}"
-          export SHELL=/app/bin/host-shell
-          exec /app/bin/emacs "$@"
-      - type: inline
-        dest-filename: host-shell
-        contents: |
-          #!/bin/sh
-          exec flatpak-spawn --host "${EMACS_HOST_SHELL:-/bin/sh}" "$@"
-      - type: inline
-        dest-filename: site-start.el
-        contents: |
-          ;; Use the host shell only for interactive shell and terminal modes.
-          ;; Other Emacs subprocess APIs intentionally stay in the Flatpak.
-          (setq shell-file-name "/app/bin/host-shell"
-                explicit-shell-file-name "/app/bin/host-shell")
-
-cleanup:
-  - /include
-  - /lib/pkgconfig
-  - /share/doc
-  - /share/man
+static void fail(const char *message)
+{
+  fprintf(stderr, "Emacs.AppImage: %s: %s\n", message, strerror(errno));
+  exit(127);
+}
 #+end_src
 
-* Build and Install
+The type-2 AppImage runtime deliberately sets the ~ARGV0~ environment variable
+that variable to its own incoming ~argv[0]~, preserving both a symlink launch
+name and a name supplied with ~exec -a~.
 
-1. Tangle the generated files:
-   #+begin_src bash
-   emacs --batch --eval '(require (quote org))' \
-         --eval '(org-babel-tangle-file "emacs-build.org")'
-   #+end_src
-2. Build the tool image.  The initial build downloads the GNOME 49 SDK and
-   Platform into the image:
-   #+begin_src bash
-   podman build -t emacs-flatpak-builder .
-   #+end_src
-3. Build a local Flatpak repository.  ~--privileged~ is needed because
-   Flatpak's build sandbox uses namespaces inside the rootless Podman
-   container; it is not an Emacs runtime permission.
-   #+begin_src bash
-   podman run --rm -it --privileged \
-          -v "$PWD:/build:Z" \
-          emacs-flatpak-builder \
-          flatpak-builder --force-clean --repo=repo build-dir org.gnu.emacs.yaml
-   #+end_src
-4. Create a distributable single-file application bundle.  It contains Emacs
-   and every module installed in ~/app~; the shared GNOME runtime remains a
-   separate Flatpak ref and will be obtained from Flathub on the recipient's
-   first installation.
-   #+begin_src bash
-   flatpak build-bundle \
-           --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
-           repo org.gnu.emacs.flatpak org.gnu.emacs
-   sha256sum org.gnu.emacs.flatpak > org.gnu.emacs.flatpak.sha256
-   #+end_src
-   Recipients install that one file with:
-   #+begin_src bash
-   flatpak --user install --bundle --reinstall org.gnu.emacs.flatpak
-   #+end_src
-   For an entirely offline distribution, distribute the GNOME 49 runtime ref
-   alongside the bundle, or distribute the ~repo/~ directory instead; a
-   Flatpak bundle cannot embed a runtime ref.
-5. Alternatively, install from the local repository on the *host* (the old
-   ~--user~ invocation installed only into the disposable container):
-   #+begin_src bash
-   flatpak --user remote-add --if-not-exists --no-gpg-verify \
-           emacs-local "file://$PWD/repo"
-   flatpak --user install --reinstall emacs-local org.gnu.emacs
-   #+end_src
+#+begin_src c :tangle AppRun.c
+static const char *original_launch_name(int argc, char **argv)
+{
+  const char *name = getenv("ARGV0");
+  if (!name || !*name)
+    name = argc > 0 ? argv[0] : "emacs";
+  const char *slash = strrchr(name, '/');
+  return slash ? slash + 1 : name;
+}
+#+end_src
 
-Run it with ~flatpak run org.gnu.emacs~.  ~M-x shell~ and ~M-x term~ use the
-host shell through ~flatpak-spawn --host~.  Other Emacs subprocess APIs remain
-inside the Flatpak runtime; user init can override the shell policy.
+Some environment variables like ~$PATH~ can contain multiple entries, so we just
+extend with the AppImage specific contents instead of overriding.
 
-* Continuous Integration
+#+begin_src c :tangle AppRun.c
+static void prepend_env(const char *name, const char *value)
+{
+    const char *old = getenv(name);
+    size_t length = strlen(value) + (old && *old ? strlen(old) + 1 : 0) + 1;
+    char *combined = malloc(length);
+    if (!combined)
+        fail("out of memory");
+    if (old && *old)
+        snprintf(combined, length, "%s:%s", value, old);
+    else
+        snprintf(combined, length, "%s", value);
+    if (setenv(name, combined, 1) < 0)
+        fail("setenv");
+    free(combined);
+}
+#+end_src
 
-~.github/workflows/weekly-flatpak.yml~ builds this rolling ~master~ configuration
-every Sunday at 03:17 UTC and can also be run manually from the Actions tab.  It
-uploads ~org.gnu.emacs.flatpak~ and its SHA-256 file as the
-~emacs-flatpak-bundle~ artifact, then deletes older artifacts with that name.
-GitHub wraps downloaded Actions artifacts in a ZIP; extract it before running
-the documented ~flatpak install --bundle~ command.
+After dispatching, the launcher establishes paths relative to ~$APPDIR~ for Emacs
+Lisp, native Lisp, helper programs, shared libraries, GTK data, and WebKit. It
+then replaces itself with the selected program and passes every argument
+through unchanged.
+
+#+begin_src c :tangle AppRun.c
+int main(int argc, char **argv)
+{
+    char appdir[PATH_MAX];
+    const char *from_env = getenv("APPDIR");
+    if (from_env && *from_env) {
+        if (snprintf(appdir, sizeof(appdir), "%s", from_env) >= (int)sizeof(appdir)) {
+            errno = ENAMETOOLONG;
+            fail("APPDIR");
+        }
+    } else {
+        ssize_t length = readlink("/proc/self/exe", appdir, sizeof(appdir) - 1);
+        if (length < 0)
+            fail("cannot locate AppRun");
+        appdir[length] = '\0';
+        char *slash = strrchr(appdir, '/');
+        if (!slash) {
+            errno = EINVAL;
+            fail("cannot locate AppDir");
+        }
+        *slash = '\0';
+    }
+
+    char bindir[PATH_MAX], library_path[PATH_MAX * 2], data[PATH_MAX];
+    char exec_path[PATH_MAX], lisp_path[PATH_MAX * 2], native_path[PATH_MAX];
+    char target[PATH_MAX], xdg_data[PATH_MAX], gio_modules[PATH_MAX];
+    char schemas[PATH_MAX], gi_types[PATH_MAX], gtk_path[PATH_MAX];
+    char gtk_im_modules[PATH_MAX], pixbuf_modules[PATH_MAX];
+    char webkit_path[PATH_MAX], webkit_bundle[PATH_MAX], gtk_prefix[PATH_MAX];
+
+#define FORMAT(destination, ...)                                                \
+    do {                                                                        \
+        if (snprintf((destination), sizeof(destination), __VA_ARGS__) >=         \
+            (int)sizeof(destination)) {                                          \
+            errno = ENAMETOOLONG;                                                \
+            fail("AppDir path");                                                \
+        }                                                                       \
+    } while (0)
+
+    FORMAT(bindir, "%s/usr/bin", appdir);
+    FORMAT(library_path, "%s/usr/lib:%s/usr/lib/" SYSTEM_ARCH, appdir, appdir);
+    FORMAT(data, "%s/usr/share/emacs/" EMACS_VERSION "/etc", appdir);
+    FORMAT(exec_path, "%s/usr/libexec/emacs/" EMACS_VERSION "/" EMACS_ARCH, appdir);
+    FORMAT(lisp_path, "%s/usr/share/emacs/site-lisp:%s/usr/share/emacs/" EMACS_VERSION "/lisp", appdir, appdir);
+    FORMAT(native_path, "%s/usr/lib/emacs/" EMACS_VERSION "/native-lisp", appdir);
+    FORMAT(xdg_data, "%s/usr/share", appdir);
+    FORMAT(gio_modules, "%s/usr/lib/gio/modules", appdir);
+    FORMAT(schemas, "%s/usr/share/glib-2.0/schemas", appdir);
+    FORMAT(gi_types, "%s/usr/lib/girepository-1.0", appdir);
+    FORMAT(gtk_prefix, "%s/usr", appdir);
+    FORMAT(gtk_path, "%s/usr/lib/gtk-3.0", appdir);
+    FORMAT(gtk_im_modules, "%s/usr/lib/gtk-3.0/3.0.0/immodules.cache", appdir);
+    FORMAT(pixbuf_modules, "%s/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache", appdir);
+    FORMAT(webkit_path, "%s/usr/lib/" SYSTEM_ARCH "/webkit2gtk-4.0", appdir);
+    FORMAT(webkit_bundle, "%s/injected-bundle", webkit_path);
+
+    prepend_env("PATH", bindir);
+    prepend_env("LD_LIBRARY_PATH", library_path);
+    prepend_env("XDG_DATA_DIRS", xdg_data);
+    prepend_env("GIO_EXTRA_MODULES", gio_modules);
+    if (setenv("GTK_DATA_PREFIX", appdir, 1) < 0 ||
+        setenv("GSETTINGS_SCHEMA_DIR", schemas, 1) < 0 ||
+        setenv("GI_TYPELIB_PATH", gi_types, 1) < 0 ||
+        setenv("GTK_EXE_PREFIX", gtk_prefix, 1) < 0 ||
+        setenv("GTK_PATH", gtk_path, 1) < 0 ||
+        setenv("GTK_IM_MODULE_FILE", gtk_im_modules, 1) < 0 ||
+        setenv("GDK_PIXBUF_MODULE_FILE", pixbuf_modules, 1) < 0 ||
+        setenv("WEBKIT_EXEC_PATH", webkit_path, 1) < 0 ||
+        setenv("WEBKIT_INJECTED_BUNDLE_PATH", webkit_bundle, 1) < 0 ||
+        setenv("EMACSDATA", data, 1) < 0 || setenv("EMACSDOC", data, 1) < 0 ||
+        setenv("EMACSPATH", exec_path, 1) < 0 ||
+        setenv("EMACSLOADPATH", lisp_path, 1) < 0 ||
+        setenv("EMACSNATIVELOADPATH", native_path, 1) < 0)
+        fail("setenv");
+
+    int client = strcmp(original_launch_name(argc, argv), "emacsclient") == 0;
+    FORMAT(target, "%s/%s", bindir, client ? "emacsclient" : "emacs");
+    argv[0] = client ? (char *)"emacsclient" : (char *)"emacs";
+    execv(target, argv);
+    fail(target);
+}
+#+end_src
+
+** Launch-name behavior
+
+Only the exact, case-sensitive launch basename ~emacsclient~ selects the bundled
+~emacsclient~. Every other name selects Emacs. Thus one artifact can provide both
+commands, by symlinking or using ~exec -a~:
+
+#+begin_src sh
+ln -s $PWD/Emacs.AppImage "$HOME/.local/bin/emacsclient"
+exec -a emacsclient $PWD/Emacs.AppImage -c
+#+end_src
+
+* Desktop metadata
+
+The desktop file is copied to the AppDir root alongside Emacs's own scalable
+icon.  Desktop integration tools may replace the executable field with the
+installed AppImage path.
+
+#+begin_src conf :tangle Emacs.desktop
+[Desktop Entry]
+Type=Application
+Name=Emacs
+GenericName=Text Editor
+Comment=Edit text with Emacs
+Exec=Emacs.AppImage %F
+Icon=Emacs
+Terminal=false
+Categories=Development;TextEditor;
+MimeType=text/plain;
+StartupWMClass=Emacs
+#+end_src
+
+* Build driver
+
+The driver first prepares the build tools. AppImages used as build tools are
+run in extract-and-run mode, so building works in containers and CI workers
+which do not expose FUSE.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+BUILD_DIR=${BUILD_DIR:-"$ROOT/.build"}
+APPDIR=${APPDIR:-"$ROOT/AppDir"}
+OUTPUT_DIR=${OUTPUT_DIR:-"$ROOT/dist"}
+EMACS_REPOSITORY=${EMACS_REPOSITORY:-https://github.com/emacs-mirror/emacs.git}
+EMACS_REF=${EMACS_REF:-master}
+JOBS=${JOBS:-$(nproc)}
+
+rm -rf "$BUILD_DIR" "$APPDIR"
+mkdir -p "$BUILD_DIR/tools" "$OUTPUT_DIR"
+rm -f "$OUTPUT_DIR/Emacs.AppImage" "$OUTPUT_DIR/Emacs.AppImage.sha256"
+
+download_tool() {
+    local url=$1 destination=$2
+    curl --fail --location --retry 5 --output "$destination" "$url"
+    chmod +x "$destination"
+}
+
+download_tool \
+  https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
+  "$BUILD_DIR/tools/linuxdeploy.AppImage"
+download_tool \
+  https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh \
+  "$BUILD_DIR/tools/linuxdeploy-plugin-gtk.sh"
+download_tool \
+  https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+  "$BUILD_DIR/tools/appimagetool.AppImage"
+
+cat >"$BUILD_DIR/tools/linuxdeploy" <<EOF
+#!/bin/sh
+exec env APPIMAGE_EXTRACT_AND_RUN=1 "$BUILD_DIR/tools/linuxdeploy.AppImage" "\$@"
+EOF
+cat >"$BUILD_DIR/tools/appimagetool" <<EOF
+#!/bin/sh
+exec env APPIMAGE_EXTRACT_AND_RUN=1 "$BUILD_DIR/tools/appimagetool.AppImage" "\$@"
+EOF
+chmod +x "$BUILD_DIR/tools/linuxdeploy" "$BUILD_DIR/tools/appimagetool"
+export PATH="$BUILD_DIR/tools:$PATH"
+#+end_src
+
+Then we are ready to clone and configure emacs.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+printf 'Cloning Emacs %s...\n' "$EMACS_REF"
+git clone --depth 1 --branch "$EMACS_REF" "$EMACS_REPOSITORY" "$BUILD_DIR/emacs"
+cd "$BUILD_DIR/emacs"
+./autogen.sh
+CC=gcc-11 CXX=g++-11 ./configure \
+  --prefix=/usr \
+  --with-pgtk \
+  --with-native-compilation \
+  --with-tree-sitter \
+  --with-imagemagick \
+  --with-dbus \
+  --with-file-notification=inotify \
+  --with-xwidgets \
+  --with-modules \
+  --with-rsvg \
+  --with-xpm \
+  --with-sound=alsa \
+  CFLAGS='-O2 -g0'
+#+end_src
+
+A repository checkout omits generated Unicode properties until bootstrap.
+compile.el currently contains a named-character escape which needs those
+properties while bootstrap-emacs is itself being made. Spell that one character
+numerically for the bootstrap pass, then restore the pristine source and let
+make rebuild anything affected for the final installation.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+compile_lisp=lisp/progmodes/compile.el
+cp "$compile_lisp" "$compile_lisp.bootstrap-original"
+trap 'mv -f "$compile_lisp.bootstrap-original" "$compile_lisp" 2>/dev/null || true' EXIT
+sed -i 's/?\\N{BULLET}/?\\u2022/g' "$compile_lisp"
+make -j"$JOBS" bootstrap
+mv "$compile_lisp.bootstrap-original" "$compile_lisp"
+trap - EXIT
+make -j"$JOBS"
+make install DESTDIR="$APPDIR"
+#+end_src
+
+Instead of hardcoding installation names or duplicating Emacs' version naming
+rules, we determine installation names.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+shopt -s nullglob
+version_dirs=("$APPDIR"/usr/share/emacs/[0-9]*)
+if ((${#version_dirs[@]} != 1)); then
+    printf 'Expected one Emacs version directory, found %d\n' "${#version_dirs[@]}" >&2
+    exit 1
+fi
+EMACS_VERSION=${version_dirs[0]##*/}
+arch_dirs=("$APPDIR/usr/libexec/emacs/$EMACS_VERSION"/*)
+if ((${#arch_dirs[@]} != 1)); then
+    printf 'Expected one Emacs architecture directory, found %d\n' "${#arch_dirs[@]}" >&2
+    exit 1
+fi
+EMACS_ARCH=${arch_dirs[0]##*/}
+SYSTEM_ARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+#+end_src
+
+The WebKit support needs a bit of special handling. WebKit launchers helper
+processes and dlopens its injected bundle, so these do not appear in Emacs's
+DT_NEEDED list. We preserve WebKit's directory layout and explicitly ask
+linuxdeploy to process every helper and shared object.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+webkit_source="/usr/lib/$SYSTEM_ARCH/webkit2gtk-4.0"
+if [[ ! -d $webkit_source ]]; then
+    echo "Cannot find $webkit_source" >&2
+    exit 1
+fi
+mkdir -p "$APPDIR/usr/lib/$SYSTEM_ARCH"
+cp -a "$webkit_source" "$APPDIR/usr/lib/$SYSTEM_ARCH/"
+webkit_deploy_args=()
+while IFS= read -r -d '' helper; do
+    webkit_deploy_args+=(--executable "$helper")
+done < <(find "$APPDIR$webkit_source" -type f -executable -print0)
+while IFS= read -r -d '' library; do
+    webkit_deploy_args+=(--library "$library")
+done < <(find "$APPDIR$webkit_source" -type f -name '*.so*' -print0)
+#+end_src
+
+Now we are ready to create the AppDir from which we'll build the final
+AppImage. Linuxdeploy installs the ELF dependencies and GTK/WebKit support
+files into ~$APPDIR~.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+icon=$(find "$APPDIR/usr/share/icons" -type f -name 'emacs.svg' -print -quit)
+if [[ -z $icon ]]; then
+    echo 'The Emacs installation did not contain emacs.svg' >&2
+    exit 1
+fi
+cp "$ROOT/Emacs.desktop" "$APPDIR/Emacs.desktop"
+cp "$icon" "$APPDIR/Emacs.svg"
+
+NO_STRIP=1 linuxdeploy \
+  --appdir "$APPDIR" \
+  --executable "$APPDIR/usr/bin/emacs" \
+  --executable "$APPDIR/usr/bin/emacsclient" \
+  --desktop-file "$APPDIR/Emacs.desktop" \
+  --icon-file "$APPDIR/Emacs.svg" \
+  "${webkit_deploy_args[@]}" \
+  --plugin gtk
+#+end_src
+
+The last step is to compile our custom launcher, add it as ~AppRun~, and build
+the final AppImage.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+gcc-11 -std=c11 -O2 -Wall -Wextra -Werror \
+  -DEMACS_VERSION=\"$EMACS_VERSION\" \
+  -DEMACS_ARCH=\"$EMACS_ARCH\" \
+  -DSYSTEM_ARCH=\"$SYSTEM_ARCH\" \
+  "$ROOT/AppRun.c" -o "$APPDIR/AppRun"
+chmod +x "$APPDIR/AppRun"
+
+ARCH=x86_64 appimagetool "$APPDIR" "$OUTPUT_DIR/Emacs.AppImage"
+(
+  cd "$OUTPUT_DIR"
+  sha256sum Emacs.AppImage >Emacs.AppImage.sha256
+)
+printf 'Created %s/Emacs.AppImage\n' "$OUTPUT_DIR"
+#+end_src
+
+* Build outputs
+
+Build with Podman:
+
+#+begin_src sh
+podman build -t emacs-appimage-builder -f Containerfile .
+podman run --rm -v "$PWD:/work:Z" emacs-appimage-builder
+#+end_src
+
+The outputs are ~dist/Emacs.AppImage~ and ~dist/Emacs.AppImage.sha256~. Override
+~EMACS_REF~, ~JOBS~, ~BUILD_DIR~, ~APPDIR~, or ~OUTPUT_DIR~ with container environment
+variables when needed. For example, ~-e EMACS_REF=emacs-30~ selects another
+branch.
+
+Verify and run the artifact with:
+
+#+begin_src sh
+sha256sum --check dist/Emacs.AppImage.sha256
+chmod +x dist/Emacs.AppImage
+dist/Emacs.AppImage
+#+end_src
+
+Where FUSE is unavailable, the AppImage runtime can extract itself to a
+temporary directory:
+
+#+begin_src sh
+APPIMAGE_EXTRACT_AND_RUN=1 dist/Emacs.AppImage --quick
+#+end_src
