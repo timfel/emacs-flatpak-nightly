@@ -93,7 +93,7 @@ through its interpreter. Instead, we use a small C program.
 
 static void fail(const char *message)
 {
-  fprintf(stderr, "Emacs.AppImage: %s: %s\n", message, strerror(errno));
+  fprintf(stderr, "Emacs AppImage: %s: %s\n", message, strerror(errno));
   exit(127);
 }
 #+end_src
@@ -232,8 +232,9 @@ the name =emacsclient= will the AppRun launcher invoke that binary, all other
 names will launch =emacs=.
 
 #+begin_src sh
-ln -s $PWD/Emacs.AppImage "$HOME/.local/bin/emacsclient"
-exec -a emacsclient $PWD/Emacs.AppImage -c
+appimage="$PWD/Emacs-EMACS_VERSION-ARCH.AppImage"
+ln -s "$appimage" "$HOME/.local/bin/emacsclient"
+exec -a emacsclient "$appimage" -c
 #+end_src
 
 * Desktop metadata
@@ -241,8 +242,9 @@ exec -a emacsclient $PWD/Emacs.AppImage -c
 A ~.desktop~ file is copied to the AppDir root alongside Emacs's own scalable
 icon. During dependency deployment its ~Exec~ field temporarily names the bundled
 ~emacs~ executable, because linuxdeploy resolves the command while processing the
-desktop file. The build changes it back to ~Emacs.AppImage~ after linuxdeploy has
-finished, so desktop integration launches this artifact.
+desktop file. The build changes it back to the architecture-specific AppImage
+filename after linuxdeploy has finished, so desktop integration launches this
+artifact.
 
 #+begin_src conf :tangle Emacs.desktop
 [Desktop Entry]
@@ -278,9 +280,22 @@ JOBS=${JOBS:-$(nproc)}
 
 export APPIMAGE_EXTRACT_AND_RUN=1
 
+APPIMAGE_ARCH=${APPIMAGE_ARCH:-$(uname -m)}
+case "$APPIMAGE_ARCH" in
+    x86_64|amd64) APPIMAGE_ARCH=x86_64 ;;
+    aarch64|arm64) APPIMAGE_ARCH=aarch64 ;;
+    *)
+        printf 'Unsupported AppImage architecture: %s\n' "$APPIMAGE_ARCH" >&2
+        exit 1
+        ;;
+esac
+
 rm -rf "$BUILD_DIR" "$APPDIR"
 mkdir -p "$BUILD_DIR/tools" "$OUTPUT_DIR"
-rm -f "$OUTPUT_DIR/Emacs.AppImage" "$OUTPUT_DIR/Emacs.AppImage.sha256"
+rm -f "$OUTPUT_DIR"/Emacs.AppImage \
+      "$OUTPUT_DIR"/Emacs.AppImage.sha256 \
+      "$OUTPUT_DIR"/Emacs-*.AppImage \
+      "$OUTPUT_DIR"/Emacs-*.AppImage.sha256
 
 download_tool() {
     local url=$1 destination=$2
@@ -289,13 +304,13 @@ download_tool() {
 }
 
 download_tool \
-  https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
+  "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${APPIMAGE_ARCH}.AppImage" \
   "$BUILD_DIR/tools/linuxdeploy"
 download_tool \
   https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh \
   "$BUILD_DIR/tools/linuxdeploy-plugin-gtk.sh"
 download_tool \
-  https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+  "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${APPIMAGE_ARCH}.AppImage" \
   "$BUILD_DIR/tools/appimagetool"
 
 export PATH="$BUILD_DIR/tools:$PATH"
@@ -362,6 +377,7 @@ if ((${#arch_dirs[@]} != 1)); then
     exit 1
 fi
 EMACS_ARCH=${arch_dirs[0]##*/}
+OUTPUT_NAME="Emacs-${EMACS_VERSION}-${APPIMAGE_ARCH}.AppImage"
 SYSTEM_ARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
 #+end_src
 
@@ -440,7 +456,7 @@ consistent.
 
 #+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
 desktop_file="$APPDIR/usr/share/applications/Emacs.desktop"
-sed -i 's/^Exec=emacs %F$/Exec=Emacs.AppImage %F/' "$desktop_file"
+sed -i "s/^Exec=emacs %F$/Exec=$OUTPUT_NAME %F/" "$desktop_file"
 #+end_src
 
 The last step is to compile our custom launcher, add it as ~AppRun~, and build
@@ -454,18 +470,19 @@ gcc-11 -std=c11 -O2 -Wall -Wextra -Werror \
   "$ROOT/AppRun.c" -o "$APPDIR/AppRun"
 chmod +x "$APPDIR/AppRun"
 
-ARCH=x86_64 appimagetool "$APPDIR" "$OUTPUT_DIR/Emacs.AppImage"
+output_path="$OUTPUT_DIR/$OUTPUT_NAME"
+ARCH="$APPIMAGE_ARCH" appimagetool "$APPDIR" "$output_path"
 (
   cd "$OUTPUT_DIR"
-  sha256sum Emacs.AppImage >Emacs.AppImage.sha256
+  sha256sum "$OUTPUT_NAME" >"$OUTPUT_NAME.sha256"
 )
-printf 'Created %s/Emacs.AppImage\n' "$OUTPUT_DIR"
+printf 'Created %s/%s\n' "$OUTPUT_DIR" "$OUTPUT_NAME"
 #+end_src
 
 Let's just smoke-check that the built AppImage can check its fingerprint.
 
 #+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-if ! fingerprint=$("$OUTPUT_DIR/Emacs.AppImage" --fingerprint); then
+if ! fingerprint=$("$output_path" --fingerprint); then
     echo 'The AppImage could not load its portable dump' >&2
     exit 1
 fi
@@ -476,25 +493,27 @@ printf 'Portable dump fingerprint: %s\n' "$fingerprint"
 
 #+begin_src sh
 podman build -t emacs-appimage-builder -f Containerfile .
-podman run --rm -v "$PWD:/work:Z" emacs-appimage-builder
+podman run --rm -e EMACS_REF -e APPIMAGE_ARCH \
+  -v "$PWD:/work:Z" emacs-appimage-builder
 #+end_src
 
-The outputs are ~dist/Emacs.AppImage~ and ~dist/Emacs.AppImage.sha256~. Override
-~EMACS_REF~, ~JOBS~, ~BUILD_DIR~, ~APPDIR~, or ~OUTPUT_DIR~ with container environment
-variables when needed. For example, ~-e EMACS_REF=emacs-30~ selects another
-branch.
+The outputs are architecture-specific files such as
+~dist/Emacs-30.0.50-x86_64.AppImage~ and their matching ~.sha256~ files.
+Override ~EMACS_REF~, ~APPIMAGE_ARCH~, ~JOBS~, ~BUILD_DIR~, ~APPDIR~, or
+~OUTPUT_DIR~ with container environment variables when needed. For example,
+~-e EMACS_REF=emacs-30~ selects another branch.
 
 Verify and run the artifact with:
 
 #+begin_src sh
-sha256sum --check dist/Emacs.AppImage.sha256
-chmod +x dist/Emacs.AppImage
-dist/Emacs.AppImage
+sha256sum --check dist/Emacs-*.AppImage.sha256
+chmod +x dist/Emacs-*.AppImage
+dist/Emacs-*.AppImage
 #+end_src
 
 Where FUSE is unavailable, the AppImage runtime can extract itself to a
 temporary directory:
 
 #+begin_src sh
-APPIMAGE_EXTRACT_AND_RUN=1 dist/Emacs.AppImage --quick
+APPIMAGE_EXTRACT_AND_RUN=1 dist/Emacs-*.AppImage --quick
 #+end_src
