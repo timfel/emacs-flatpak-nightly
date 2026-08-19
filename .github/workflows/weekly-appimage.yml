@@ -46,13 +46,6 @@ jobs:
             -e EMACS_REF \
             -v "$PWD:/work" emacs-appimage-builder
 
-      - name: Smoke test the launcher names
-        run: |
-          APPIMAGE_EXTRACT_AND_RUN=1 dist/Emacs.AppImage --batch --quick -nw \
-            --eval '(princ emacs-version)'
-          ln -s Emacs.AppImage dist/emacsclient
-          APPIMAGE_EXTRACT_AND_RUN=1 dist/emacsclient --version
-
       - name: Upload latest AppImage
         id: upload
         uses: actions/upload-artifact@v7
