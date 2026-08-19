@@ -410,6 +410,29 @@ NO_STRIP=1 linuxdeploy \
   --plugin gtk
 #+end_src
 
+Emacs looks for its portable dump before it processes ~EMACSPATH~, so that
+variable cannot relocate the compile-time ~/usr/libexec~ dump path into the
+AppDir. Its first lookup is beside the resolved executable, using the executable
+basename plus ~.pdmp~. The installation has a single fingerprinted dump under
+~usr/libexec~; expose it at that first lookup location with a relative symlink.
+Do this after linuxdeploy has finished modifying the executable.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+dump_files=("$APPDIR/usr/libexec/emacs/$EMACS_VERSION/$EMACS_ARCH"/*.pdmp)
+if ((${#dump_files[@]} != 1)); then
+    printf 'Expected one Emacs portable dump, found %d\n' "${#dump_files[@]}" >&2
+    exit 1
+fi
+emacs_binary=$(readlink -f "$APPDIR/usr/bin/emacs")
+if [[ ! -x $emacs_binary || $emacs_binary != "$APPDIR/usr/bin/"* ]]; then
+    echo 'Cannot resolve the installed Emacs executable' >&2
+    exit 1
+fi
+dump_link="$APPDIR/usr/bin/${emacs_binary##*/}.pdmp"
+dump_target="../libexec/emacs/$EMACS_VERSION/$EMACS_ARCH/${dump_files[0]##*/}"
+ln -s "$dump_target" "$dump_link"
+#+end_src
+
 Now linuxdeploy has finished resolving ~Exec=emacs~ and we can restore the
 command intended for the installed AppImage desktop entry. The root desktop
 file is a symlink to this copy after deployment, so both locations stay
@@ -437,6 +460,16 @@ ARCH=x86_64 appimagetool "$APPDIR" "$OUTPUT_DIR/Emacs.AppImage"
   sha256sum Emacs.AppImage >Emacs.AppImage.sha256
 )
 printf 'Created %s/Emacs.AppImage\n' "$OUTPUT_DIR"
+#+end_src
+
+Let's just smoke-check that the built AppImage can check its fingerprint.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+if ! fingerprint=$("$OUTPUT_DIR/Emacs.AppImage" --fingerprint); then
+    echo 'The AppImage could not load its portable dump' >&2
+    exit 1
+fi
+printf 'Portable dump fingerprint: %s\n' "$fingerprint"
 #+end_src
 
 * Build outputs
