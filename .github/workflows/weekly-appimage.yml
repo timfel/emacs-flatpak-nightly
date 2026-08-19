@@ -27,7 +27,7 @@ jobs:
       EMACS_REF: ${{ inputs.emacs_ref || 'master' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Tangle the build files
         run: |
@@ -48,14 +48,14 @@ jobs:
 
       - name: Smoke test the launcher names
         run: |
-          APPIMAGE_EXTRACT_AND_RUN=1 dist/Emacs.AppImage --batch --quick \
+          APPIMAGE_EXTRACT_AND_RUN=1 dist/Emacs.AppImage --batch --quick -nw \
             --eval '(princ emacs-version)'
           ln -s Emacs.AppImage dist/emacsclient
           APPIMAGE_EXTRACT_AND_RUN=1 dist/emacsclient --version
 
       - name: Upload latest AppImage
         id: upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: emacs-appimage
           path: |
@@ -81,7 +81,7 @@ jobs:
           echo "tag=$tag" >>"$GITHUB_OUTPUT"
 
       - name: Prune old releases
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const prefix = "emacs-appimage-";

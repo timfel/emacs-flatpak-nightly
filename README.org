@@ -4,30 +4,28 @@
 
 * Overview
 
-This document is both the explanation and the complete source for building
-Emacs ~master~ as a PGTK (native Wayland) AppImage for x86-64 Linux.  The build
-enables native compilation, tree-sitter, the built-arser,
-ImageMagick, XWidgets, D-Bus, dynamic modules, file notifications, sound, SVG,
-XPM, and the usual image formats.
+This document is the complete source for building Emacs ~master~ as a PGTK
+(native Wayland) AppImage for Linux. The build enables native compilation,
+tree-sitter, the built-arser, ImageMagick, XWidgets, D-Bus, dynamic modules,
+file notifications, sound, SVG, XPM, and the usual image formats.
 
-An AppImage is an ordinary, unsandboxed process.  Emacs can use the host
-filesystem, D-Bus session, devices, environment, and commands directly.  The
+An [[https://appimage.org/][AppImage]] is a deployment bundle, not a andbox. Emacs can use the host
+filesystem, D-Bus session, devices, environment, and commands directly. The
 artifact contains Emacs and its non-core runtime dependencies, but uses the
-host kernel, display server, and other fundamental system facilities.
+host kernel, display server, and other fundamental system facilities. While
+AppImages may be less popular than e.g. Flatpaks, Emacs really benefits from
+unrestricted system access, so this distribution format seems more suitable.
 
 The compilation environment is Ubuntu 22.04, which gives the result a
-reasonably old glibc baseline.  ~linuxdeploy~ gathers ELF dependencies and its
-GTK plugin installs GTK, GIO, icon, schema, and loader data.  WebKit helper
-processes and injected bundles are included explicitly because they are loaded
-at runtime and do not all appear in Emacs's ELF dependency list.
+reasonably old glibc baseline so it should work on many current Linux
+distributions.
 
-Emacs follows a moving Git branch by default, so this is a rolling build rather
-than a bit-for-bit reproducible release.  ~EMACS_REF~ can select a branch, tag,
-or commit when a fixed input is desired.
+Emacs follows a moving Git branch by default, so this is a rolling build.
+~EMACS_REF~ can select a branch, tag, or commit when a fixed input is desired.
 
 * Tangle the build
 
-Every project file is contained below.  From the repository root, create or
+Every project file is contained below. From the repository root, create or
 refresh them with:
 
 #+begin_src sh
@@ -44,31 +42,34 @@ The container supplies compilation headers and tools. Runtime libraries are
 subsequently selected from this old userspace and copied into the AppDir.
 
 #+begin_src dockerfile :tangle Containerfile
-  FROM ubuntu:22.04
+FROM ubuntu:22.04
 
-  ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
 
-  # Build on an older userspace so the resulting AppImage works on newer Linux
-  # distributions as well.  These packages are build inputs only; linuxdeploy
-  # copies the required runtime libraries into the AppDir.
-  RUN apt-get update && apt-get install -y --no-install-recommends \
-        autoconf automake build-essential ca-certificates curl file git \
-        libacl1-dev libasound2-dev libdbus-1-dev libgif-dev libgnutls28-dev \
-        libgpm-dev libgtk-3-dev libharfbuzz-dev libjpeg-dev \
-        libmagickwand-dev libncurses-dev libotf-dev libpng-dev librsvg2-dev \
-        libselinux1-dev libsqlite3-dev libsystemd-dev libtiff-dev \
-        libtree-sitter-dev libwebkit2gtk-4.0-dev libwebp-dev libxpm-dev \
-        libxml2-dev libgccjit-11-dev gcc-11 g++-11 make pkg-config texinfo \
-      && rm -rf /var/lib/apt/lists/*
+# Build on an older userspace so the resulting AppImage works on newer Linux
+# distributions as well. These packages are build inputs only; linuxdeploy
+# copies the required runtime libraries into the AppDir.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      autoconf automake build-essential ca-certificates curl file git \
+      libacl1-dev libasound2-dev libdbus-1-dev libgif-dev libgnutls28-dev \
+      libgpm-dev libgtk-3-dev libharfbuzz-dev libjpeg-dev \
+      libmagickwand-dev libncurses-dev libotf-dev libpng-dev librsvg2-dev \
+      libselinux1-dev libsqlite3-dev libsystemd-dev libtiff-dev \
+      libtree-sitter-dev libwebkit2gtk-4.0-dev libwebp-dev libxpm-dev \
+      libxml2-dev libgccjit-11-dev gcc-11 g++-11 make pkg-config texinfo \
+    && rm -rf /var/lib/apt/lists/*
 
-  WORKDIR /work
-  ENTRYPOINT ["/work/build-appimage.sh"]
+WORKDIR /work
+ENTRYPOINT ["/work/build-appimage.sh"]
 #+end_src
 
 * AppImage launcher
 
-A shell ~AppRun~ would lose useful control over ~argv[0]~ while passing through
-its interpreter. Instead, we use a small C launcher.
+AppImage uses the [[https://docs.appimage.org/reference/appdir.html][AppDir]] specification to lay out a bundle. The entry point is
+always called ~AppRun~. For Emacs, we have two interesting binaries a user might
+want to launch: =emacs= and =emacsclient=. To support both, we use a custom
+launcher. A shell script would lose useful control over ~argv[0]~ while passing
+through its interpreter. Instead, we use a small C program.
 
 #+begin_src c :tangle AppRun.c
 #define _GNU_SOURCE
@@ -97,9 +98,9 @@ static void fail(const char *message)
 }
 #+end_src
 
-The type-2 AppImage runtime deliberately sets the ~ARGV0~ environment variable
-that variable to its own incoming ~argv[0]~, preserving both a symlink launch
-name and a name supplied with ~exec -a~.
+The AppImage runtime deliberately sets the ~ARGV0~ environment variable its own
+incoming ~argv[0]~, preserving both a symlink launch name and a name supplied
+with ~exec -a~.
 
 #+begin_src c :tangle AppRun.c
 static const char *original_launch_name(int argc, char **argv)
@@ -113,7 +114,8 @@ static const char *original_launch_name(int argc, char **argv)
 #+end_src
 
 Some environment variables like ~$PATH~ can contain multiple entries, so we just
-extend with the AppImage specific contents instead of overriding.
+extend with the AppImage specific contents instead of overriding. This allows
+the Emacs process to find its own =etags= and =ebrowse= binaries, for example.
 
 #+begin_src c :tangle AppRun.c
 static void prepend_env(const char *name, const char *value)
@@ -223,9 +225,11 @@ int main(int argc, char **argv)
 
 ** Launch-name behavior
 
-Only the exact, case-sensitive launch basename ~emacsclient~ selects the bundled
-~emacsclient~. Every other name selects Emacs. Thus one artifact can provide both
-commands, by symlinking or using ~exec -a~:
+As mentioned, we want both =emacs= and =emacsclient= to be user-invocable through
+this single AppImage. Through ~ARGV0~ inspecting code above, one artifact can
+provide both commands, by symlinking or using ~exec -a~. Only when executed with
+the name =emacsclient= will the AppRun launcher invoke that binary, all other
+names will launch =emacs=.
 
 #+begin_src sh
 ln -s $PWD/Emacs.AppImage "$HOME/.local/bin/emacsclient"
@@ -234,11 +238,11 @@ exec -a emacsclient $PWD/Emacs.AppImage -c
 
 * Desktop metadata
 
-The desktop file is copied to the AppDir root alongside Emacs's own scalable
-icon.  During dependency deployment its ~Exec~ field temporarily names the
-bundled ~emacs~ executable, because linuxdeploy resolves the command while
-processing the desktop file.  The build changes it back to ~Emacs.AppImage~
-after linuxdeploy has finished, so desktop integration launches this artifact.
+A ~.desktop~ file is copied to the AppDir root alongside Emacs's own scalable
+icon. During dependency deployment its ~Exec~ field temporarily names the bundled
+~emacs~ executable, because linuxdeploy resolves the command while processing the
+desktop file. The build changes it back to ~Emacs.AppImage~ after linuxdeploy has
+finished, so desktop integration launches this artifact.
 
 #+begin_src conf :tangle Emacs.desktop
 [Desktop Entry]
@@ -257,8 +261,8 @@ StartupWMClass=Emacs
 * Build driver
 
 The driver first prepares the build tools. AppImages used as build tools are
-run in extract-and-run mode, so building works in containers and CI workers
-which do not expose FUSE.
+run in extract-and-run mode by setting ~APPIMAGE_EXTRACT_AND_RUN=1~, so building
+works in containers and CI workers which do not expose FUSE.
 
 #+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
 #!/usr/bin/env bash
@@ -272,6 +276,8 @@ EMACS_REPOSITORY=${EMACS_REPOSITORY:-https://github.com/emacs-mirror/emacs.git}
 EMACS_REF=${EMACS_REF:-master}
 JOBS=${JOBS:-$(nproc)}
 
+export APPIMAGE_EXTRACT_AND_RUN=1
+
 rm -rf "$BUILD_DIR" "$APPDIR"
 mkdir -p "$BUILD_DIR/tools" "$OUTPUT_DIR"
 rm -f "$OUTPUT_DIR/Emacs.AppImage" "$OUTPUT_DIR/Emacs.AppImage.sha256"
@@ -284,27 +290,19 @@ download_tool() {
 
 download_tool \
   https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage \
-  "$BUILD_DIR/tools/linuxdeploy.AppImage"
+  "$BUILD_DIR/tools/linuxdeploy"
 download_tool \
   https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh \
   "$BUILD_DIR/tools/linuxdeploy-plugin-gtk.sh"
 download_tool \
   https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
-  "$BUILD_DIR/tools/appimagetool.AppImage"
+  "$BUILD_DIR/tools/appimagetool"
 
-cat >"$BUILD_DIR/tools/linuxdeploy" <<EOF
-#!/bin/sh
-exec env APPIMAGE_EXTRACT_AND_RUN=1 "$BUILD_DIR/tools/linuxdeploy.AppImage" "\$@"
-EOF
-cat >"$BUILD_DIR/tools/appimagetool" <<EOF
-#!/bin/sh
-exec env APPIMAGE_EXTRACT_AND_RUN=1 "$BUILD_DIR/tools/appimagetool.AppImage" "\$@"
-EOF
-chmod +x "$BUILD_DIR/tools/linuxdeploy" "$BUILD_DIR/tools/appimagetool"
 export PATH="$BUILD_DIR/tools:$PATH"
 #+end_src
 
-Then we are ready to clone and configure emacs.
+Then we are ready to clone and configure Emacs with as many options enabled as
+we can.
 
 #+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
 printf 'Cloning Emacs %s...\n' "$EMACS_REF"
@@ -326,6 +324,8 @@ CC=gcc-11 CXX=g++-11 ./configure \
   --with-sound=alsa \
   CFLAGS='-O2 -g0'
 #+end_src
+
+_!!! Temporary Hack Time !!!_
 
 A repository checkout omits generated Unicode properties until bootstrap.
 compile.el currently contains a named-character escape which needs those
@@ -410,7 +410,7 @@ NO_STRIP=1 linuxdeploy \
   --plugin gtk
 #+end_src
 
-Now linuxdeploy has finished resolving Exec=emacs and we can restore the
+Now linuxdeploy has finished resolving ~Exec=emacs~ and we can restore the
 command intended for the installed AppImage desktop entry. The root desktop
 file is a symlink to this copy after deployment, so both locations stay
 consistent.
@@ -440,8 +440,6 @@ printf 'Created %s/Emacs.AppImage\n' "$OUTPUT_DIR"
 #+end_src
 
 * Build outputs
-
-Build with Podman:
 
 #+begin_src sh
 podman build -t emacs-appimage-builder -f Containerfile .
