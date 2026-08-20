@@ -56,7 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libmagickwand-dev libncurses-dev libotf-dev libpng-dev librsvg2-dev \
       libselinux1-dev libsqlite3-dev libsystemd-dev libtiff-dev \
       libtree-sitter-dev libwebkit2gtk-4.0-dev libwebp-dev libxpm-dev \
-      libxml2-dev libgccjit-11-dev gcc-11 g++-11 make pkg-config texinfo \
+      libxml2-dev libgccjit-12-dev gcc-12 g++-12 make pkg-config texinfo \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
@@ -89,6 +89,12 @@ through its interpreter. Instead, we use a small C program.
 #endif
 #ifndef SYSTEM_ARCH
 #error "SYSTEM_ARCH must be supplied by the build"
+#endif
+#ifndef GCC_VERSION
+#error "GCC_VERSION must be supplied by the build"
+#endif
+#ifndef GCC_TRIPLET
+#error "GCC_TRIPLET must be supplied by the build"
 #endif
 
 static void fail(const char *message)
@@ -136,9 +142,9 @@ static void prepend_env(const char *name, const char *value)
 #+end_src
 
 After dispatching, the launcher establishes paths relative to ~$APPDIR~ for Emacs
-Lisp, native Lisp, helper programs, shared libraries, GTK data, and WebKit. It
-then replaces itself with the selected program and passes every argument
-through unchanged.
+Lisp, native Lisp, GCC JIT, helper programs, shared libraries, GTK data, and
+WebKit. It then replaces itself with the selected program and passes every
+argument through unchanged.
 
 #+begin_src c :tangle AppRun.c
 int main(int argc, char **argv)
@@ -164,6 +170,8 @@ int main(int argc, char **argv)
     }
 
     char bindir[PATH_MAX], library_path[PATH_MAX * 2], data[PATH_MAX];
+    char gcc_prefix[PATH_MAX], gcc_compilers[PATH_MAX * 2];
+    char gcc_libraries[PATH_MAX * 3];
     char exec_path[PATH_MAX], lisp_path[PATH_MAX * 2], native_path[PATH_MAX];
     char target[PATH_MAX], xdg_data[PATH_MAX], gio_modules[PATH_MAX];
     char schemas[PATH_MAX], gi_types[PATH_MAX], gtk_path[PATH_MAX];
@@ -181,6 +189,12 @@ int main(int argc, char **argv)
 
     FORMAT(bindir, "%s/usr/bin", appdir);
     FORMAT(library_path, "%s/usr/lib:%s/usr/lib/" SYSTEM_ARCH, appdir, appdir);
+    FORMAT(gcc_prefix, "%s/usr/lib/gcc/", appdir);
+    FORMAT(gcc_compilers, "%s/usr/libexec/gcc/%s/" GCC_VERSION ":%s/usr/bin",
+           appdir, GCC_TRIPLET, appdir);
+    FORMAT(gcc_libraries,
+           "%s/usr/lib/gcc/%s/" GCC_VERSION ":%s/usr/lib/" SYSTEM_ARCH ":%s/usr/lib",
+           appdir, GCC_TRIPLET, appdir, appdir);
     FORMAT(data, "%s/usr/share/emacs/" EMACS_VERSION "/etc", appdir);
     FORMAT(exec_path, "%s/usr/libexec/emacs/" EMACS_VERSION "/" EMACS_ARCH, appdir);
     FORMAT(lisp_path, "%s/usr/share/emacs/site-lisp:%s/usr/share/emacs/" EMACS_VERSION "/lisp", appdir, appdir);
@@ -198,9 +212,14 @@ int main(int argc, char **argv)
 
     prepend_env("PATH", bindir);
     prepend_env("LD_LIBRARY_PATH", library_path);
+    prepend_env("COMPILER_PATH", gcc_compilers);
+    prepend_env("LIBRARY_PATH", gcc_libraries);
+    if (setenv("GCC_EXEC_PREFIX", gcc_prefix, 1) < 0)
+        fail("setenv");
     prepend_env("XDG_DATA_DIRS", xdg_data);
-    prepend_env("GIO_EXTRA_MODULES", gio_modules);
-    if (setenv("GTK_DATA_PREFIX", appdir, 1) < 0 ||
+    if (setenv("GIO_MODULE_DIR", gio_modules, 1) < 0 ||
+        setenv("GIO_EXTRA_MODULES", gio_modules, 1) < 0 ||
+        setenv("GTK_DATA_PREFIX", appdir, 1) < 0 ||
         setenv("GSETTINGS_SCHEMA_DIR", schemas, 1) < 0 ||
         setenv("GI_TYPELIB_PATH", gi_types, 1) < 0 ||
         setenv("GTK_EXE_PREFIX", gtk_prefix, 1) < 0 ||
@@ -324,7 +343,7 @@ printf 'Cloning Emacs %s...\n' "$EMACS_REF"
 git clone --depth 1 --branch "$EMACS_REF" "$EMACS_REPOSITORY" "$BUILD_DIR/emacs"
 cd "$BUILD_DIR/emacs"
 ./autogen.sh
-CC=gcc-11 CXX=g++-11 ./configure \
+CC=gcc-12 CXX=g++-12 ./configure \
   --prefix=/usr \
   --with-pgtk \
   --with-native-compilation \
@@ -381,6 +400,94 @@ OUTPUT_NAME="Emacs-${EMACS_VERSION}-${APPIMAGE_ARCH}.AppImage"
 SYSTEM_ARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
 #+end_src
 
+GCC's JIT driver needs the matching GCC installation at runtime. Linuxdeploy
+only sees the ~libgccjit.so~ dependency, so we need to stage the driver, GCC's
+target files, startup objects, and the linker frontends explicitly. The
+target-prefixed driver name is the name libgccjit looks up before falling back
+to a hard-coded system path.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+GCC_VERSION=12
+GCC_BINARY="gcc-${GCC_VERSION}"
+GCC_TRIPLET=$($GCC_BINARY -dumpmachine)
+GCC_DRIVER_NAME="${GCC_TRIPLET}-gcc-${GCC_VERSION}"
+GCC_DRIVER_SOURCE="/usr/bin/${GCC_DRIVER_NAME}"
+if [[ ! -x $GCC_DRIVER_SOURCE ]]; then
+    GCC_DRIVER_SOURCE=$(command -v "$GCC_BINARY" || true)
+fi
+if [[ -z $GCC_DRIVER_SOURCE || ! -x $GCC_DRIVER_SOURCE ]]; then
+    printf 'Cannot find the GCC %s driver\n' "$GCC_VERSION" >&2
+    exit 1
+fi
+
+GCC_LIB_DIR=$(dirname "$($GCC_BINARY -print-file-name=libgcc.a)")
+GCC_PROGRAM_SOURCE=$($GCC_BINARY -print-prog-name=cc1)
+GCC_PROGRAM_DIR=$(dirname "$GCC_PROGRAM_SOURCE")
+if [[ ! -d $GCC_LIB_DIR || ! -d $GCC_PROGRAM_DIR || ! -x $GCC_PROGRAM_SOURCE ]]; then
+    printf 'Cannot find the GCC %s runtime directories\n' "$GCC_VERSION" >&2
+    exit 1
+fi
+for required in crtbeginS.o crtendS.o libgcc.a; do
+    if [[ ! -f $GCC_LIB_DIR/$required ]]; then
+        printf 'GCC runtime is missing %s\n' "$required" >&2
+        exit 1
+    fi
+done
+
+mkdir -p "$APPDIR/usr/lib/gcc/$GCC_TRIPLET" \
+         "$APPDIR/usr/libexec/gcc/$GCC_TRIPLET" \
+         "$APPDIR/usr/lib/$SYSTEM_ARCH"
+cp -a "$GCC_LIB_DIR" "$APPDIR/usr/lib/gcc/$GCC_TRIPLET/"
+if [[ $GCC_PROGRAM_DIR == "$GCC_LIB_DIR" ]]; then
+    ln -s "../../../lib/gcc/$GCC_TRIPLET/$GCC_VERSION" \
+        "$APPDIR/usr/libexec/gcc/$GCC_TRIPLET/$GCC_VERSION"
+else
+    cp -a "$GCC_PROGRAM_DIR" "$APPDIR/usr/libexec/gcc/$GCC_TRIPLET/"
+fi
+install -Dm755 "$GCC_DRIVER_SOURCE" "$APPDIR/usr/bin/$GCC_DRIVER_NAME"
+
+for tool in as ld; do
+    tool_source=$(command -v "$tool")
+    install -Dm755 "$(readlink -f "$tool_source")" "$APPDIR/usr/bin/$tool"
+done
+
+for support in \
+    crt1.o Scrt1.o crti.o crtn.o rcrt1.o \
+    libc.so libc_nonshared.a libm.so libmvec.so libmvec_nonshared.a \
+    libdl.so libpthread.so librt.so libgcc_s.so.1; do
+    support_source=$($GCC_BINARY -print-file-name="$support")
+    if [[ $support_source != "$support" && -f $support_source ]]; then
+        install -Dm644 "$support_source" "$APPDIR/usr/lib/$SYSTEM_ARCH/$support"
+    fi
+done
+
+gcc_deploy_args=(
+    --executable "$APPDIR/usr/bin/$GCC_DRIVER_NAME"
+    --executable "$APPDIR/usr/bin/as"
+    --executable "$APPDIR/usr/bin/ld"
+    --library "$APPDIR/usr/lib/$SYSTEM_ARCH/libgcc_s.so.1"
+)
+#+end_src
+
+GIO is compiled against an old GLib on purpose. This can be incompatible with
+the host GLib (the host dconf module is one example), so we also copy the
+matching modules from the Ubuntu build environment and make that directory
+exclusive at runtime.
+
+#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+gio_modules_source="/usr/lib/$SYSTEM_ARCH/gio/modules"
+if [[ ! -d $gio_modules_source ]]; then
+    echo "Cannot find $gio_modules_source" >&2
+    exit 1
+fi
+mkdir -p "$APPDIR/usr/lib/gio"
+cp -a "$gio_modules_source" "$APPDIR/usr/lib/gio/"
+gio_deploy_args=()
+while IFS= read -r -d '' module; do
+    gio_deploy_args+=(--library "$module")
+done < <(find "$APPDIR/usr/lib/gio/modules" -type f -name '*.so*' -print0)
+#+end_src
+
 The WebKit support needs a bit of special handling. WebKit launchers helper
 processes and dlopens its injected bundle, so these do not appear in Emacs's
 DT_NEEDED list. We preserve WebKit's directory layout and explicitly ask
@@ -422,6 +529,8 @@ NO_STRIP=1 linuxdeploy \
   --executable "$APPDIR/usr/bin/emacsclient" \
   --desktop-file "$APPDIR/Emacs.desktop" \
   --icon-file "$APPDIR/Emacs.svg" \
+  "${gcc_deploy_args[@]}" \
+  "${gio_deploy_args[@]}" \
   "${webkit_deploy_args[@]}" \
   --plugin gtk
 #+end_src
@@ -463,10 +572,12 @@ The last step is to compile our custom launcher, add it as ~AppRun~, and build
 the final AppImage.
 
 #+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-gcc-11 -std=c11 -O2 -Wall -Wextra -Werror \
+gcc-12 -std=c11 -O2 -Wall -Wextra -Werror \
   -DEMACS_VERSION=\"$EMACS_VERSION\" \
   -DEMACS_ARCH=\"$EMACS_ARCH\" \
   -DSYSTEM_ARCH=\"$SYSTEM_ARCH\" \
+  -DGCC_VERSION=\"$GCC_VERSION\" \
+  -DGCC_TRIPLET=\"$GCC_TRIPLET\" \
   "$ROOT/AppRun.c" -o "$APPDIR/AppRun"
 chmod +x "$APPDIR/AppRun"
 
@@ -479,7 +590,7 @@ ARCH="$APPIMAGE_ARCH" appimagetool "$APPDIR" "$output_path"
 printf 'Created %s/%s\n' "$OUTPUT_DIR" "$OUTPUT_NAME"
 #+end_src
 
-Let's just smoke-check that the built AppImage can check its fingerprint.
+Smoke-check both the portable dump file is discovered correctly.
 
 #+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
 if ! fingerprint=$("$output_path" --fingerprint); then
