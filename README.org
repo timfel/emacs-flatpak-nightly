@@ -1,269 +1,85 @@
-#+TITLE: A full-featured Wayland Emacs AppImage
+#+TITLE: A host-integrated portable Emacs
 #+AUTHOR: Containerized Build Pipeline
 #+PROPERTY: header-args :eval never
 
-* Overview
+* Objectives
 
-This document is the complete source for building Emacs ~master~ as a PGTK
-(native Wayland) AppImage for Linux. The build enables native compilation,
-tree-sitter, the built-arser, ImageMagick, XWidgets, D-Bus, dynamic modules,
-file notifications, sound, SVG, XPM, and the usual image formats.
+The result is a normal, unsandboxed build of Emacs ~master~ for current Linux
+desktops.  It has PGTK, native compilation, tree-sitter, ImageMagick, XWidgets,
+D-Bus, dynamic modules, file notifications, sound, SVG, XPM, and the common
+image formats.  It is distributed as architecture-specific ~tar.zst~ archives
+which a normal user can extract at any writable location.
 
-An [[https://appimage.org/][AppImage]] is a deployment bundle, not a andbox. Emacs can use the host
-filesystem, D-Bus session, devices, environment, and commands directly. The
-artifact contains Emacs and its non-core runtime dependencies, but uses the
-host kernel, display server, and other fundamental system facilities. While
-AppImages may be less popular than e.g. Flatpaks, Emacs really benefits from
-unrestricted system access, so this distribution format seems more suitable.
+Six properties determine the design:
 
-The compilation environment is Ubuntu 22.04, which gives the result a
-reasonably old glibc baseline so it should work on many current Linux
-distributions.
+1. Emacs and every enabled feature must be exercised after installation.
+2. One artifact per architecture must run on current Debian, Ubuntu, Linux Mint,
+   and Fedora systems.
+3. Emacs and all of its subprocesses must have ordinary host access.
+4. Installation must not require root access.
+5. Libraries, modules, helper programs, data, and the portable dump must remain
+   integrated after the prefix is moved.
+6. Neither Emacs nor its subprocesses may depend on ~LD_LIBRARY_PATH~,
+   ~GCC_EXEC_PREFIX~, ~COMPILER_PATH~, or ~LIBRARY_PATH~.
 
-Emacs follows a moving Git branch by default, so this is a rolling build.
-~EMACS_REF~ can select a branch, tag, or commit when a fixed input is desired.
+The implementation uses Debian 12 as a glibc 2.36 baseline.  The artifact is
+portable across the supported distributions, but not across CPU architectures.
+The runtime contract requires GTK 3 and WebKitGTK 4.1 from the host.
 
-* Tangle the build
+* Result 1: a deliberate host ABI boundary
 
-Every project file is contained below. From the repository root, create or
-refresh them with:
+GTK and WebKit load many libraries and modules into one ELF namespace.  A
+bundled old GLib cannot safely coexist with a host libsoup built against a newer
+GLib, even though both libraries retain their SONAMEs.  The artifact therefore
+leaves the complete transitive closures of its host-facing features to the
+host.  This includes GTK, GLib, GObject, GIO, GdkPixbuf, Pango, Cairo, dconf,
+WebKitGTK, libsoup, GStreamer, common image codecs, font libraries, the graphics
+stack, Wayland, D-Bus, glibc, and any other library reached from those roots.
 
-#+begin_src sh
-emacs --batch --quick --eval '(require (quote org))' \
-  --eval '(org-babel-tangle-file "README.org")'
-#+end_src
+ImageMagick's own ABI, quantum variant, modules, and configuration layout are
+less stable.  Its MagickWand/MagickCore libraries and matching modules are
+bundled, but dependencies which overlap the host platform closure are not.
+Tree-sitter and libgccjit are also private application components.  Private
+libraries live in ~lib/private~; no host-platform SONAME is allowed there.
 
-The generated files are ignored by Git; this Org document and the workflow are
-the maintained sources.
-
-* Builder container
-
-The container supplies compilation headers and tools. Runtime libraries are
-subsequently selected from this old userspace and copied into the AppDir.
+The builder supplies the oldest supported headers and all tools needed to
+construct and inspect that boundary.
 
 #+begin_src dockerfile :tangle Containerfile
-FROM ubuntu:22.04
+FROM debian:bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Build on an older userspace so the resulting AppImage works on newer Linux
-# distributions as well. These packages are build inputs only; linuxdeploy
-# copies the required runtime libraries into the AppDir.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      autoconf automake build-essential ca-certificates curl file git \
+      autoconf automake binutils build-essential ca-certificates file git \
       libacl1-dev libasound2-dev libdbus-1-dev libgif-dev libgnutls28-dev \
       libgpm-dev libgtk-3-dev libharfbuzz-dev libjpeg-dev \
       libmagickwand-dev libncurses-dev libotf-dev libpng-dev librsvg2-dev \
       libselinux1-dev libsqlite3-dev libsystemd-dev libtiff-dev \
-      libtree-sitter-dev libwebkit2gtk-4.0-dev libwebp-dev libxpm-dev \
-      libxml2-dev libgccjit-12-dev gcc-12 g++-12 make pkg-config texinfo \
+      libtree-sitter-dev libwebkit2gtk-4.1-dev libwebp-dev libxpm-dev \
+      libxml2-dev libgccjit-12-dev gcc-12 g++-12 make patchelf pkg-config \
+      python3 pax-utils texinfo zstd \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
-ENTRYPOINT ["/work/build-appimage.sh"]
+ENTRYPOINT ["/work/build-bundle.sh"]
 #+end_src
 
-* AppImage launcher
+* Result 2: a relocatable native Emacs process
 
-AppImage uses the [[https://docs.appimage.org/reference/appdir.html][AppDir]] specification to lay out a bundle. The entry point is
-always called ~AppRun~. For Emacs, we have two interesting binaries a user might
-want to launch: =emacs= and =emacsclient=. To support both, we use a custom
-launcher. A shell script would lose useful control over ~argv[0]~ while passing
-through its interpreter. Instead, we use a small C program.
+The installed executable is the unmodified Emacs binary, not a container
+command or custom launcher.  An ~environment.sh~ file supplies Emacs's
+relocated Lisp, data, helper, and native-Lisp directories.  The portable dump
+is exposed beside the executable under the filename Emacs checks first.
 
-#+begin_src c :tangle AppRun.c
-#define _GNU_SOURCE
+ImageMagick needs process-local search paths, so ~environment.sh~ exports its
+module and configuration paths.  The private compiler path is narrower: the
+site-start file adds it only while native-compilation workers are started.
+Ordinary subprocesses retain the user's ~PATH~.  Site files are optional:
+~emacs -Q~ remains pristine and does not promise run-time native compilation.
 
-#include <errno.h>
-#include <limits.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
-#ifndef EMACS_VERSION
-#error "EMACS_VERSION must be supplied by the build"
-#endif
-#ifndef EMACS_ARCH
-#error "EMACS_ARCH must be supplied by the build"
-#endif
-#ifndef SYSTEM_ARCH
-#error "SYSTEM_ARCH must be supplied by the build"
-#endif
-#ifndef GCC_VERSION
-#error "GCC_VERSION must be supplied by the build"
-#endif
-#ifndef GCC_TRIPLET
-#error "GCC_TRIPLET must be supplied by the build"
-#endif
-
-static void fail(const char *message)
-{
-  fprintf(stderr, "Emacs AppImage: %s: %s\n", message, strerror(errno));
-  exit(127);
-}
-#+end_src
-
-The AppImage runtime deliberately sets the ~ARGV0~ environment variable its own
-incoming ~argv[0]~, preserving both a symlink launch name and a name supplied
-with ~exec -a~.
-
-#+begin_src c :tangle AppRun.c
-static const char *original_launch_name(int argc, char **argv)
-{
-  const char *name = getenv("ARGV0");
-  if (!name || !*name)
-    name = argc > 0 ? argv[0] : "emacs";
-  const char *slash = strrchr(name, '/');
-  return slash ? slash + 1 : name;
-}
-#+end_src
-
-Some environment variables like ~$PATH~ can contain multiple entries, so we just
-extend with the AppImage specific contents instead of overriding. This allows
-the Emacs process to find its own =etags= and =ebrowse= binaries, for example.
-
-#+begin_src c :tangle AppRun.c
-static void prepend_env(const char *name, const char *value)
-{
-    const char *old = getenv(name);
-    size_t length = strlen(value) + (old && *old ? strlen(old) + 1 : 0) + 1;
-    char *combined = malloc(length);
-    if (!combined)
-        fail("out of memory");
-    if (old && *old)
-        snprintf(combined, length, "%s:%s", value, old);
-    else
-        snprintf(combined, length, "%s", value);
-    if (setenv(name, combined, 1) < 0)
-        fail("setenv");
-    free(combined);
-}
-#+end_src
-
-After dispatching, the launcher establishes paths relative to ~$APPDIR~ for Emacs
-Lisp, native Lisp, GCC JIT, helper programs, shared libraries, GTK data, and
-WebKit. It then replaces itself with the selected program and passes every
-argument through unchanged.
-
-#+begin_src c :tangle AppRun.c
-int main(int argc, char **argv)
-{
-    char appdir[PATH_MAX];
-    const char *from_env = getenv("APPDIR");
-    if (from_env && *from_env) {
-        if (snprintf(appdir, sizeof(appdir), "%s", from_env) >= (int)sizeof(appdir)) {
-            errno = ENAMETOOLONG;
-            fail("APPDIR");
-        }
-    } else {
-        ssize_t length = readlink("/proc/self/exe", appdir, sizeof(appdir) - 1);
-        if (length < 0)
-            fail("cannot locate AppRun");
-        appdir[length] = '\0';
-        char *slash = strrchr(appdir, '/');
-        if (!slash) {
-            errno = EINVAL;
-            fail("cannot locate AppDir");
-        }
-        *slash = '\0';
-    }
-
-    char bindir[PATH_MAX], library_path[PATH_MAX * 2], data[PATH_MAX];
-    char gcc_prefix[PATH_MAX], gcc_compilers[PATH_MAX * 2];
-    char gcc_libraries[PATH_MAX * 3];
-    char exec_path[PATH_MAX], lisp_path[PATH_MAX * 2], native_path[PATH_MAX];
-    char target[PATH_MAX], xdg_data[PATH_MAX], gio_modules[PATH_MAX];
-    char schemas[PATH_MAX], gi_types[PATH_MAX], gtk_path[PATH_MAX];
-    char gtk_im_modules[PATH_MAX], pixbuf_modules[PATH_MAX];
-    char webkit_path[PATH_MAX], webkit_bundle[PATH_MAX], gtk_prefix[PATH_MAX];
-
-#define FORMAT(destination, ...)                                                \
-    do {                                                                        \
-        if (snprintf((destination), sizeof(destination), __VA_ARGS__) >=         \
-            (int)sizeof(destination)) {                                          \
-            errno = ENAMETOOLONG;                                                \
-            fail("AppDir path");                                                \
-        }                                                                       \
-    } while (0)
-
-    FORMAT(bindir, "%s/usr/bin", appdir);
-    FORMAT(library_path, "%s/usr/lib:%s/usr/lib/" SYSTEM_ARCH, appdir, appdir);
-    FORMAT(gcc_prefix, "%s/usr/lib/gcc/", appdir);
-    FORMAT(gcc_compilers, "%s/usr/libexec/gcc/%s/" GCC_VERSION ":%s/usr/bin",
-           appdir, GCC_TRIPLET, appdir);
-    FORMAT(gcc_libraries,
-           "%s/usr/lib/gcc/%s/" GCC_VERSION ":%s/usr/lib/" SYSTEM_ARCH ":%s/usr/lib",
-           appdir, GCC_TRIPLET, appdir, appdir);
-    FORMAT(data, "%s/usr/share/emacs/" EMACS_VERSION "/etc", appdir);
-    FORMAT(exec_path, "%s/usr/libexec/emacs/" EMACS_VERSION "/" EMACS_ARCH, appdir);
-    FORMAT(lisp_path, "%s/usr/share/emacs/site-lisp:%s/usr/share/emacs/" EMACS_VERSION "/lisp", appdir, appdir);
-    FORMAT(native_path, "%s/usr/lib/emacs/" EMACS_VERSION "/native-lisp", appdir);
-    FORMAT(xdg_data, "%s/usr/share", appdir);
-    FORMAT(gio_modules, "%s/usr/lib/gio/modules", appdir);
-    FORMAT(schemas, "%s/usr/share/glib-2.0/schemas", appdir);
-    FORMAT(gi_types, "%s/usr/lib/girepository-1.0", appdir);
-    FORMAT(gtk_prefix, "%s/usr", appdir);
-    FORMAT(gtk_path, "%s/usr/lib/gtk-3.0", appdir);
-    FORMAT(gtk_im_modules, "%s/usr/lib/gtk-3.0/3.0.0/immodules.cache", appdir);
-    FORMAT(pixbuf_modules, "%s/usr/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache", appdir);
-    FORMAT(webkit_path, "%s/usr/lib/" SYSTEM_ARCH "/webkit2gtk-4.0", appdir);
-    FORMAT(webkit_bundle, "%s/injected-bundle", webkit_path);
-
-    prepend_env("PATH", bindir);
-    prepend_env("LD_LIBRARY_PATH", library_path);
-    prepend_env("COMPILER_PATH", gcc_compilers);
-    prepend_env("LIBRARY_PATH", gcc_libraries);
-    if (setenv("GCC_EXEC_PREFIX", gcc_prefix, 1) < 0)
-        fail("setenv");
-    prepend_env("XDG_DATA_DIRS", xdg_data);
-    if (setenv("GIO_MODULE_DIR", gio_modules, 1) < 0 ||
-        setenv("GIO_EXTRA_MODULES", gio_modules, 1) < 0 ||
-        setenv("GTK_DATA_PREFIX", appdir, 1) < 0 ||
-        setenv("GSETTINGS_SCHEMA_DIR", schemas, 1) < 0 ||
-        setenv("GI_TYPELIB_PATH", gi_types, 1) < 0 ||
-        setenv("GTK_EXE_PREFIX", gtk_prefix, 1) < 0 ||
-        setenv("GTK_PATH", gtk_path, 1) < 0 ||
-        setenv("GTK_IM_MODULE_FILE", gtk_im_modules, 1) < 0 ||
-        setenv("GDK_PIXBUF_MODULE_FILE", pixbuf_modules, 1) < 0 ||
-        setenv("WEBKIT_EXEC_PATH", webkit_path, 1) < 0 ||
-        setenv("WEBKIT_INJECTED_BUNDLE_PATH", webkit_bundle, 1) < 0 ||
-        setenv("EMACSDATA", data, 1) < 0 || setenv("EMACSDOC", data, 1) < 0 ||
-        setenv("EMACSPATH", exec_path, 1) < 0 ||
-        setenv("EMACSLOADPATH", lisp_path, 1) < 0 ||
-        setenv("EMACSNATIVELOADPATH", native_path, 1) < 0)
-        fail("setenv");
-
-    int client = strcmp(original_launch_name(argc, argv), "emacsclient") == 0;
-    FORMAT(target, "%s/%s", bindir, client ? "emacsclient" : "emacs");
-    argv[0] = client ? (char *)"emacsclient" : (char *)"emacs";
-    execv(target, argv);
-    fail(target);
-}
-#+end_src
-
-** Launch-name behavior
-
-As mentioned, we want both =emacs= and =emacsclient= to be user-invocable through
-this single AppImage. Through ~ARGV0~ inspecting code above, one artifact can
-provide both commands, by symlinking or using ~exec -a~. Only when executed with
-the name =emacsclient= will the AppRun launcher invoke that binary, all other
-names will launch =emacs=.
-
-#+begin_src sh
-appimage="$PWD/Emacs-EMACS_VERSION-ARCH.AppImage"
-ln -s "$appimage" "$HOME/.local/bin/emacsclient"
-exec -a emacsclient "$appimage" -c
-#+end_src
-
-* Desktop metadata
-
-A ~.desktop~ file is copied to the AppDir root alongside Emacs's own scalable
-icon. During dependency deployment its ~Exec~ field temporarily names the bundled
-~emacs~ executable, because linuxdeploy resolves the command while processing the
-desktop file. The build changes it back to the architecture-specific AppImage
-filename after linuxdeploy has finished, so desktop integration launches this
-artifact.
+The desktop file deliberately names ~emacs~.  A user can add the extracted
+~bin~ directory to ~PATH~ or replace ~Exec~ with an absolute installation path.
 
 #+begin_src conf :tangle Emacs.desktop
 [Desktop Entry]
@@ -279,74 +95,64 @@ MimeType=text/plain;
 StartupWMClass=Emacs
 #+end_src
 
-* Build driver
 
-The driver first prepares the build tools. AppImages used as build tools are
-run in extract-and-run mode by setting ~APPIMAGE_EXTRACT_AND_RUN=1~, so building
-works in containers and CI workers which do not expose FUSE.
+The build begins by selecting native architecture names and cloning the
+requested Emacs revision.
 
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 #!/usr/bin/env bash
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BUILD_DIR=${BUILD_DIR:-"$ROOT/.build"}
-APPDIR=${APPDIR:-"$ROOT/AppDir"}
+PREFIX_DIR=${PREFIX_DIR:-"$ROOT/.prefix"}
 OUTPUT_DIR=${OUTPUT_DIR:-"$ROOT/dist"}
 EMACS_REPOSITORY=${EMACS_REPOSITORY:-https://github.com/emacs-mirror/emacs.git}
 EMACS_REF=${EMACS_REF:-master}
 JOBS=${JOBS:-$(nproc)}
+GCC_VERSION=${GCC_VERSION:-12}
+BUILD_GCC=${BUILD_GCC:-gcc-$GCC_VERSION}
+BUILD_GXX=${BUILD_GXX:-g++-$GCC_VERSION}
+GCC_TRIPLET=$($BUILD_GCC -dumpmachine)
 
-export APPIMAGE_EXTRACT_AND_RUN=1
-
-APPIMAGE_ARCH=${APPIMAGE_ARCH:-$(uname -m)}
-case "$APPIMAGE_ARCH" in
-    x86_64|amd64) APPIMAGE_ARCH=x86_64 ;;
-    aarch64|arm64) APPIMAGE_ARCH=aarch64 ;;
-    *)
-        printf 'Unsupported AppImage architecture: %s\n' "$APPIMAGE_ARCH" >&2
-        exit 1
-        ;;
+machine=$(uname -m)
+case "$machine" in
+    x86_64|amd64) machine=x86_64 ;;
+    aarch64|arm64) machine=aarch64 ;;
+    *) printf 'Unsupported build architecture: %s\n' "$machine" >&2; exit 1 ;;
 esac
+BUNDLE_ARCH=${BUNDLE_ARCH:-$machine}
+case "$BUNDLE_ARCH" in
+    x86_64|amd64) BUNDLE_ARCH=x86_64 ;;
+    aarch64|arm64) BUNDLE_ARCH=aarch64 ;;
+    *) printf 'Unsupported bundle architecture: %s\n' "$BUNDLE_ARCH" >&2; exit 1 ;;
+esac
+if [[ $BUNDLE_ARCH != "$machine" ]]; then
+    printf 'Native build architecture %s does not match requested %s\n' \
+        "$machine" "$BUNDLE_ARCH" >&2
+    exit 1
+fi
 
-rm -rf "$BUILD_DIR" "$APPDIR"
-mkdir -p "$BUILD_DIR/tools" "$OUTPUT_DIR"
-rm -f "$OUTPUT_DIR"/Emacs.AppImage \
-      "$OUTPUT_DIR"/Emacs.AppImage.sha256 \
-      "$OUTPUT_DIR"/Emacs-*.AppImage \
-      "$OUTPUT_DIR"/Emacs-*.AppImage.sha256
+rm -rf "$BUILD_DIR" "$PREFIX_DIR"
+mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
+rm -f "$OUTPUT_DIR"/Emacs-*.tar.zst "$OUTPUT_DIR"/Emacs-*.tar.zst.sha256
 
-download_tool() {
-    local url=$1 destination=$2
-    curl --fail --location --retry 5 --output "$destination" "$url"
-    chmod +x "$destination"
-}
-
-download_tool \
-  "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${APPIMAGE_ARCH}.AppImage" \
-  "$BUILD_DIR/tools/linuxdeploy"
-download_tool \
-  https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh \
-  "$BUILD_DIR/tools/linuxdeploy-plugin-gtk.sh"
-download_tool \
-  "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${APPIMAGE_ARCH}.AppImage" \
-  "$BUILD_DIR/tools/appimagetool"
-
-export PATH="$BUILD_DIR/tools:$PATH"
-#+end_src
-
-Then we are ready to clone and configure Emacs with as many options enabled as
-we can.
-
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
 printf 'Cloning Emacs %s...\n' "$EMACS_REF"
 git clone --depth 1 --branch "$EMACS_REF" "$EMACS_REPOSITORY" "$BUILD_DIR/emacs"
 cd "$BUILD_DIR/emacs"
+#+end_src
+
+Native Lisp shared objects do not need C startup files.  The site-start file
+therefore supplies ~-nostdlib~ to the private linker, removing any runtime
+dependency on a host ~glibc-devel~ package or distribution-specific libc linker
+script.
+
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 ./autogen.sh
-CC=gcc-12 CXX=g++-12 ./configure \
+CC="$BUILD_GCC" CXX="$BUILD_GXX" ./configure \
   --prefix=/usr \
   --with-pgtk \
-  --with-native-compilation \
+  --with-native-compilation=aot \
   --with-tree-sitter \
   --with-imagemagick \
   --with-dbus \
@@ -357,232 +163,337 @@ CC=gcc-12 CXX=g++-12 ./configure \
   --with-xpm \
   --with-sound=alsa \
   CFLAGS='-O2 -g0'
+
+make bootstrap
+make -j"$JOBS" all
+make install DESTDIR="$PREFIX_DIR"
 #+end_src
 
-_!!! Temporary Hack Time !!!_
+The installed version and architecture names come from the installation rather
+than assumptions about Emacs naming rules.
 
-A repository checkout omits generated Unicode properties until bootstrap.
-compile.el currently contains a named-character escape which needs those
-properties while bootstrap-emacs is itself being made. Spell that one character
-numerically for the bootstrap pass, then restore the pristine source and let
-make rebuild anything affected for the final installation.
-
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-compile_lisp=lisp/progmodes/compile.el
-cp "$compile_lisp" "$compile_lisp.bootstrap-original"
-trap 'mv -f "$compile_lisp.bootstrap-original" "$compile_lisp" 2>/dev/null || true' EXIT
-sed -i 's/?\\N{BULLET}/?\\u2022/g' "$compile_lisp"
-make -j"$JOBS" bootstrap
-mv "$compile_lisp.bootstrap-original" "$compile_lisp"
-trap - EXIT
-make -j"$JOBS"
-make install DESTDIR="$APPDIR"
-#+end_src
-
-Instead of hardcoding installation names or duplicating Emacs' version naming
-rules, we determine installation names.
-
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 shopt -s nullglob
-version_dirs=("$APPDIR"/usr/share/emacs/[0-9]*)
+version_dirs=("$PREFIX_DIR"/usr/share/emacs/[0-9]*)
 if ((${#version_dirs[@]} != 1)); then
     printf 'Expected one Emacs version directory, found %d\n' "${#version_dirs[@]}" >&2
     exit 1
 fi
 EMACS_VERSION=${version_dirs[0]##*/}
-arch_dirs=("$APPDIR/usr/libexec/emacs/$EMACS_VERSION"/*)
+arch_dirs=("$PREFIX_DIR/usr/libexec/emacs/$EMACS_VERSION"/*)
 if ((${#arch_dirs[@]} != 1)); then
     printf 'Expected one Emacs architecture directory, found %d\n' "${#arch_dirs[@]}" >&2
     exit 1
 fi
 EMACS_ARCH=${arch_dirs[0]##*/}
-OUTPUT_NAME="Emacs-${EMACS_VERSION}-${APPIMAGE_ARCH}.AppImage"
-SYSTEM_ARCH=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+PACKAGE_NAME="Emacs-${EMACS_VERSION}-${BUNDLE_ARCH}"
+OUTPUT_NAME="${PACKAGE_NAME}.tar.zst"
 #+end_src
 
-GCC's JIT driver needs the matching GCC installation at runtime. Linuxdeploy
-only sees the ~libgccjit.so~ dependency, so we need to stage the driver, GCC's
-target files, startup objects, and the linker frontends explicitly. The
-target-prefixed driver name is the name libgccjit looks up before falling back
-to a hard-coded system path.
+* Result 3: private ImageMagick without a second platform stack
 
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-GCC_VERSION=12
-GCC_BINARY="gcc-${GCC_VERSION}"
-GCC_TRIPLET=$($GCC_BINARY -dumpmachine)
-GCC_DRIVER_NAME="${GCC_TRIPLET}-gcc-${GCC_VERSION}"
-GCC_DRIVER_SOURCE="/usr/bin/${GCC_DRIVER_NAME}"
-if [[ ! -x $GCC_DRIVER_SOURCE ]]; then
-    GCC_DRIVER_SOURCE=$(command -v "$GCC_BINARY" || true)
-fi
-if [[ -z $GCC_DRIVER_SOURCE || ! -x $GCC_DRIVER_SOURCE ]]; then
-    printf 'Cannot find the GCC %s driver\n' "$GCC_VERSION" >&2
-    exit 1
-fi
+ImageMagick resources are normalized to stable paths inside the archive.  Only
+its own libraries, modules, and non-platform dependencies are deployed.  The
+host closure is computed from GTK, WebKitGTK, and every non-private library
+linked directly by Emacs; this makes the boundary adapt to changes in Emacs's
+configure results without maintaining a second manual codec list.
 
-GCC_LIB_DIR=$(dirname "$($GCC_BINARY -print-file-name=libgcc.a)")
-GCC_PROGRAM_SOURCE=$($GCC_BINARY -print-prog-name=cc1)
-GCC_PROGRAM_DIR=$(dirname "$GCC_PROGRAM_SOURCE")
-if [[ ! -d $GCC_LIB_DIR || ! -d $GCC_PROGRAM_DIR || ! -x $GCC_PROGRAM_SOURCE ]]; then
-    printf 'Cannot find the GCC %s runtime directories\n' "$GCC_VERSION" >&2
-    exit 1
-fi
-for required in crtbeginS.o crtendS.o libgcc.a; do
-    if [[ ! -f $GCC_LIB_DIR/$required ]]; then
-        printf 'GCC runtime is missing %s\n' "$required" >&2
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
+resolve_library() {
+    local soname=$1 path
+    path=$(ldconfig -p | awk -v soname="$soname" '$1 == soname { print $NF; exit }')
+    if [[ -z $path || ! -e $path ]]; then
+        printf 'Cannot find required library %s\n' "$soname" >&2
+        exit 1
+    fi
+    printf '%s\n' "$path"
+}
+
+elf_soname() {
+    readelf -d "$1" | awk -F'[][]' '/SONAME/ { print $2; exit }'
+}
+
+private_lib="$PREFIX_DIR/usr/lib/private"
+mkdir -p "$private_lib"
+
+magick_libdir=$(pkg-config --variable=libdir MagickWand-6.Q16)
+magick_wand=$(find "$magick_libdir" -maxdepth 1 -type l -name 'libMagickWand-6.Q16.so.*' -print -quit)
+magick_version_dir=$(find "$magick_libdir" -maxdepth 1 -type d -name 'ImageMagick-*' -print -quit)
+magick_modules_dir=$(find "$magick_version_dir" -maxdepth 1 -type d -name 'modules-*' -print -quit)
+magick_config_dir=$(find "$magick_version_dir" -maxdepth 1 -type d -name 'config-*' -print -quit)
+magick_coders_dir="$magick_modules_dir/coders"
+magick_filters_dir="$magick_modules_dir/filters"
+magick_share_source=/usr/share/ImageMagick-6
+magick_etc_source=/etc/ImageMagick-6
+for required in "$magick_wand" "$magick_config_dir" "$magick_coders_dir" \
+                "$magick_filters_dir" "$magick_share_source" "$magick_etc_source"; do
+    if [[ ! -e $required ]]; then
+        printf 'Cannot locate ImageMagick resource %s\n' "$required" >&2
         exit 1
     fi
 done
 
-mkdir -p "$APPDIR/usr/lib/gcc/$GCC_TRIPLET" \
-         "$APPDIR/usr/libexec/gcc/$GCC_TRIPLET" \
-         "$APPDIR/usr/lib/$SYSTEM_ARCH"
-cp -a "$GCC_LIB_DIR" "$APPDIR/usr/lib/gcc/$GCC_TRIPLET/"
-if [[ $GCC_PROGRAM_DIR == "$GCC_LIB_DIR" ]]; then
-    ln -s "../../../lib/gcc/$GCC_TRIPLET/$GCC_VERSION" \
-        "$APPDIR/usr/libexec/gcc/$GCC_TRIPLET/$GCC_VERSION"
-else
-    cp -a "$GCC_PROGRAM_DIR" "$APPDIR/usr/libexec/gcc/$GCC_TRIPLET/"
-fi
-install -Dm755 "$GCC_DRIVER_SOURCE" "$APPDIR/usr/bin/$GCC_DRIVER_NAME"
+mkdir -p "$PREFIX_DIR/usr/lib/ImageMagick/config" \
+         "$PREFIX_DIR/usr/lib/ImageMagick/coders" \
+         "$PREFIX_DIR/usr/lib/ImageMagick/filters" \
+         "$PREFIX_DIR/usr/etc" "$PREFIX_DIR/usr/share"
+cp -a "$magick_config_dir"/. "$PREFIX_DIR/usr/lib/ImageMagick/config/"
+cp -a "$magick_coders_dir"/. "$PREFIX_DIR/usr/lib/ImageMagick/coders/"
+cp -a "$magick_filters_dir"/. "$PREFIX_DIR/usr/lib/ImageMagick/filters/"
+cp -a "$magick_etc_source" "$PREFIX_DIR/usr/etc/"
+cp -a "$magick_share_source" "$PREFIX_DIR/usr/share/"
 
-for tool in as ld; do
-    tool_source=$(command -v "$tool")
-    install -Dm755 "$(readlink -f "$tool_source")" "$APPDIR/usr/bin/$tool"
+libgccjit_root=$(resolve_library libgccjit.so.0)
+tree_sitter_root=$(resolve_library libtree-sitter.so.0)
+magick_wand_soname=$(elf_soname "$magick_wand")
+libgccjit_soname=$(elf_soname "$libgccjit_root")
+tree_sitter_soname=$(elf_soname "$tree_sitter_root")
+
+declare -A private_root_seen=()
+private_root_seen[$magick_wand_soname]=present
+private_root_seen[$libgccjit_soname]=present
+private_root_seen[$tree_sitter_soname]=present
+
+declare -A host_library_seen=()
+host_library_names=()
+add_host_library() {
+    local path=$1 name=${1##*/}
+    if [[ -z ${host_library_seen[$name]+present} ]]; then
+        host_library_seen[$name]=present
+        host_library_names+=("$name")
+    fi
+}
+
+host_roots=(libgtk-3.so.0 libwebkit2gtk-4.1.so.0)
+for executable in "$PREFIX_DIR/usr/bin/emacs" "$PREFIX_DIR/usr/bin/emacsclient"; do
+    while IFS= read -r name; do
+        [[ -n ${private_root_seen[$name]+present} ]] || host_roots+=("$name")
+    done < <(readelf -d "$executable" | awk -F'[][]' '/NEEDED/ { print $2 }')
 done
 
-for support in \
-    crt1.o Scrt1.o crti.o crtn.o rcrt1.o \
-    libc.so libc_nonshared.a libm.so libmvec.so libmvec_nonshared.a \
-    libdl.so libpthread.so librt.so libgcc_s.so.1; do
-    support_source=$($GCC_BINARY -print-file-name="$support")
-    if [[ $support_source != "$support" && -f $support_source ]]; then
-        install -Dm644 "$support_source" "$APPDIR/usr/lib/$SYSTEM_ARCH/$support"
+declare -A host_root_seen=()
+for root in "${host_roots[@]}"; do
+    [[ -n ${host_root_seen[$root]+present} ]] && continue
+    host_root_seen[$root]=present
+    root_path=$(resolve_library "$root")
+    if ! closure=$(lddtree -l "$root_path"); then
+        printf 'Cannot compute host dependency closure for %s\n' "$root" >&2
+        exit 1
+    fi
+    while IFS= read -r path; do
+        [[ $path == /* ]] && add_host_library "$path"
+    done <<<"$closure"
+done
+
+copy_private_library() {
+    local path=$1 name=${1##*/} real real_name
+    [[ -n ${host_library_seen[$name]+present} ]] && return
+    real=$(readlink -f "$path")
+    [[ -f $real ]] || { printf 'Cannot copy dependency %s\n' "$path" >&2; exit 1; }
+    real_name=${real##*/}
+    if [[ ! -e $private_lib/$real_name ]]; then
+        cp -a "$real" "$private_lib/$real_name"
+    fi
+    if [[ $name != "$real_name" && ! -e $private_lib/$name ]]; then
+        ln -s "$real_name" "$private_lib/$name"
+    fi
+}
+
+deploy_private_dependencies() {
+    local root=$1 root_real path
+    root_real=$(readlink -f "$root")
+    if ! closure=$(lddtree -l "$root"); then
+        printf 'Cannot compute private dependency closure for %s\n' "$root" >&2
+        exit 1
+    fi
+    while IFS= read -r path; do
+        [[ $path == /* ]] || continue
+        [[ $(readlink -f "$path") == "$root_real" ]] && continue
+        copy_private_library "$path"
+    done <<<"$closure"
+}
+
+deploy_private_root() {
+    copy_private_library "$1"
+    deploy_private_dependencies "$1"
+}
+
+deploy_private_root "$magick_wand"
+deploy_private_root "$libgccjit_root"
+deploy_private_root "$tree_sitter_root"
+while IFS= read -r -d '' module; do
+    deploy_private_dependencies "$module"
+done < <(find "$PREFIX_DIR/usr/lib/ImageMagick" -type f -name '*.so*' -print0)
+#+end_src
+
+* Result 4: native compilation without compiler environment variables
+
+The private native compiler contains only the libgccjit DSO, its private
+non-platform dependencies, the target GCC driver, ~collect2~, assembler, linker,
+and the private dependencies of binutils.  Native Lisp is linked with
+~-nostdlib~, so headers, libc development files, and GCC startup objects are not
+runtime inputs.
+
+Two internal native-compilation entry points are advised: one starts synchronous
+workers and one starts queued asynchronous workers.  Each advice dynamically
+prepends the private tool directory to Lisp's ~process-environment~ only while
+Emacs creates the worker.  The worker inherits the tool path, while unrelated
+subprocesses—including an explicit host ~gcc~—do not.  No GCC search-path
+variable or global library-path variable is used.
+
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
+toolchain="$PREFIX_DIR/usr/libexec/native-comp"
+tool_bin="$toolchain/bin"
+tool_lib="$toolchain/lib"
+tool_gcc="$toolchain/lib/gcc/$GCC_TRIPLET/$GCC_VERSION"
+mkdir -p "$tool_bin" "$tool_lib" "$tool_gcc"
+
+GCC_DRIVER_SOURCE=/usr/bin/$GCC_TRIPLET-gcc-$GCC_VERSION
+[[ -x $GCC_DRIVER_SOURCE ]] || GCC_DRIVER_SOURCE=$(command -v "$BUILD_GCC")
+install -m755 "$GCC_DRIVER_SOURCE" "$tool_bin/$GCC_TRIPLET-gcc-$GCC_VERSION"
+install -m755 "$(readlink -f "$(command -v as)")" "$tool_bin/as"
+install -m755 "$(readlink -f "$(command -v ld)")" "$tool_bin/ld"
+install -m755 "$($BUILD_GCC -print-prog-name=collect2)" "$tool_gcc/collect2"
+
+declare -A tool_library_seen=()
+copy_tool_library() {
+    local path=$1 name=${1##*/} real real_name
+    case "$name" in
+        ld-linux*.so.*|libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*)
+            return ;;
+    esac
+    real=$(readlink -f "$path")
+    [[ -f $real ]] || return
+    real_name=${real##*/}
+    if [[ -z ${tool_library_seen[$real_name]+present} ]]; then
+        cp -a "$real" "$tool_lib/$real_name"
+        tool_library_seen[$real_name]=present
+    fi
+    if [[ $name != "$real_name" && ! -e $tool_lib/$name ]]; then
+        ln -s "$real_name" "$tool_lib/$name"
+    fi
+}
+
+for executable in "$tool_bin/as" "$tool_bin/ld"; do
+    while IFS= read -r path; do
+        [[ $path == /* ]] && copy_tool_library "$path"
+    done < <(lddtree -l "$executable")
+done
+
+mkdir -p "$PREFIX_DIR/usr/share/emacs/site-lisp"
+cat >"$PREFIX_DIR/usr/share/emacs/site-lisp/site-start.el" <<EOF
+;;; site-start.el --- portable native compiler setup -*- lexical-binding: t; -*-
+
+(defvar emacs-portable--native-comp-bin nil)
+
+(let* ((site-directory (file-name-directory (or load-file-name buffer-file-name)))
+       (prefix (expand-file-name "../../.." site-directory))
+       (toolchain (expand-file-name "libexec/native-comp/" prefix)))
+  (setq native-comp-driver-options
+        (list "-nostdlib"
+              (concat "-B" toolchain "bin/")
+              (concat "-B" toolchain
+                      "lib/gcc/$GCC_TRIPLET/$GCC_VERSION/"))
+        emacs-portable--native-comp-bin
+        (expand-file-name "bin" toolchain)))
+
+(defun emacs-portable--with-native-comp-path (function &rest arguments)
+  (let ((process-environment (copy-sequence process-environment)))
+    (setenv "PATH" (concat emacs-portable--native-comp-bin
+                            path-separator (or (getenv "PATH") "")))
+    (apply function arguments)))
+
+(advice-add 'comp--native-compile :around
+            #'emacs-portable--with-native-comp-path)
+(advice-add 'comp--run-async-workers :around
+            #'emacs-portable--with-native-comp-path)
+EOF
+#+end_src
+
+* Result 5: relative ELF lookup and ordinary installation
+
+Every application ELF receives a RUNPATH relative to ~$ORIGIN~ and pointing
+only at ~lib/private~.  Toolchain executables and libraries use a separate
+relative RUNPATH to their own private directory.  No ELF gets an absolute
+RUNPATH and no launcher supplies a global library path.
+
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
+patch_runpath() {
+    local elf=$1 destination=$2 relative runpath type
+    type=$(readelf -h "$elf" 2>/dev/null | awk '/Type:/ { print $2; exit }')
+    [[ $type == DYN || $type == EXEC ]] || return
+    relative=$(realpath --relative-to="$(dirname "$elf")" "$destination")
+    if [[ $relative == . ]]; then
+        runpath='$ORIGIN'
+    else
+        runpath="\$ORIGIN/$relative"
+    fi
+    patchelf --set-rpath "$runpath" "$elf"
+}
+
+while IFS= read -r -d '' elf; do
+    [[ $elf == "$toolchain/"* ]] && continue
+    patch_runpath "$elf" "$private_lib"
+done < <(find "$PREFIX_DIR/usr" -type f -print0)
+while IFS= read -r -d '' elf; do
+    patch_runpath "$elf" "$tool_lib"
+done < <(find "$toolchain" -type f -print0)
+
+for library in "${host_library_names[@]}"; do
+    if find "$private_lib" \( -type f -o -type l \) -name "$library" \
+            -print -quit | grep -q .; then
+        printf 'Host platform library was bundled unexpectedly: %s\n' "$library" >&2
+        exit 1
     fi
 done
 
-gcc_deploy_args=(
-    --executable "$APPDIR/usr/bin/$GCC_DRIVER_NAME"
-    --executable "$APPDIR/usr/bin/as"
-    --executable "$APPDIR/usr/bin/ld"
-    --library "$APPDIR/usr/lib/$SYSTEM_ARCH/libgcc_s.so.1"
-)
-#+end_src
+icon=$(find "$PREFIX_DIR/usr/share/icons" -type f -name emacs.svg -print -quit)
+[[ -n $icon ]] || { echo 'The Emacs installation did not contain emacs.svg' >&2; exit 1; }
+cp "$ROOT/Emacs.desktop" "$PREFIX_DIR/usr/Emacs.desktop"
+cp "$icon" "$PREFIX_DIR/usr/Emacs.svg"
 
-GIO is compiled against an old GLib on purpose. This can be incompatible with
-the host GLib (the host dconf module is one example), so we also copy the
-matching modules from the Ubuntu build environment and make that directory
-exclusive at runtime.
+for command in emacs emacsclient; do
+    [[ -x $PREFIX_DIR/usr/bin/$command ]] || {
+        printf 'Missing installed command: %s\n' "$command" >&2
+        exit 1
+    }
+done
 
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-gio_modules_source="/usr/lib/$SYSTEM_ARCH/gio/modules"
-if [[ ! -d $gio_modules_source ]]; then
-    echo "Cannot find $gio_modules_source" >&2
-    exit 1
-fi
-mkdir -p "$APPDIR/usr/lib/gio"
-cp -a "$gio_modules_source" "$APPDIR/usr/lib/gio/"
-gio_deploy_args=()
-while IFS= read -r -d '' module; do
-    gio_deploy_args+=(--library "$module")
-done < <(find "$APPDIR/usr/lib/gio/modules" -type f -name '*.so*' -print0)
-#+end_src
+rm -rf "$BUILD_DIR/package"
+mkdir -p "$BUILD_DIR/package/$PACKAGE_NAME"
+final_prefix="$BUILD_DIR/package/$PACKAGE_NAME"
+cp -a "$PREFIX_DIR/usr"/. "$final_prefix/"
 
-The WebKit support needs a bit of special handling. WebKit launchers helper
-processes and dlopens its injected bundle, so these do not appear in Emacs's
-DT_NEEDED list. We preserve WebKit's directory layout and explicitly ask
-linuxdeploy to process every helper and shared object.
+cat >"$final_prefix/environment.sh" <<EOF
+# Source this file before running Emacs from this prefix.
+_emacs_prefix=\$(CDPATH= cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)
+export PATH="\$_emacs_prefix/bin:\$PATH"
+export MAGICK_HOME="\$_emacs_prefix"
+export MAGICK_CONFIGURE_PATH="\$_emacs_prefix/lib/ImageMagick/config:\$_emacs_prefix/etc/ImageMagick-6:\$_emacs_prefix/share/ImageMagick-6"
+export MAGICK_CODER_MODULE_PATH="\$_emacs_prefix/lib/ImageMagick/coders"
+export MAGICK_FILTER_MODULE_PATH="\$_emacs_prefix/lib/ImageMagick/filters"
+export EMACSDATA="\$_emacs_prefix/share/emacs/$EMACS_VERSION/etc"
+export EMACSDOC="\$_emacs_prefix/share/emacs/$EMACS_VERSION/etc"
+export EMACSPATH="\$_emacs_prefix/libexec/emacs/$EMACS_VERSION/$EMACS_ARCH"
+export EMACSLOADPATH="\$_emacs_prefix/share/emacs/site-lisp:\$_emacs_prefix/share/emacs/$EMACS_VERSION/lisp"
+export EMACSNATIVELOADPATH="\$_emacs_prefix/lib/emacs/$EMACS_VERSION/native-lisp"
+unset _emacs_prefix
+EOF
 
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-webkit_source="/usr/lib/$SYSTEM_ARCH/webkit2gtk-4.0"
-if [[ ! -d $webkit_source ]]; then
-    echo "Cannot find $webkit_source" >&2
-    exit 1
-fi
-mkdir -p "$APPDIR/usr/lib/$SYSTEM_ARCH"
-cp -a "$webkit_source" "$APPDIR/usr/lib/$SYSTEM_ARCH/"
-webkit_deploy_args=()
-while IFS= read -r -d '' helper; do
-    webkit_deploy_args+=(--executable "$helper")
-done < <(find "$APPDIR$webkit_source" -type f -executable -print0)
-while IFS= read -r -d '' library; do
-    webkit_deploy_args+=(--library "$library")
-done < <(find "$APPDIR$webkit_source" -type f -name '*.so*' -print0)
-#+end_src
-
-Now we are ready to create the AppDir from which we'll build the final
-AppImage. Linuxdeploy installs the ELF dependencies and GTK/WebKit support
-files into ~$APPDIR~.
-
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-icon=$(find "$APPDIR/usr/share/icons" -type f -name 'emacs.svg' -print -quit)
-if [[ -z $icon ]]; then
-    echo 'The Emacs installation did not contain emacs.svg' >&2
-    exit 1
-fi
-cp "$ROOT/Emacs.desktop" "$APPDIR/Emacs.desktop"
-cp "$icon" "$APPDIR/Emacs.svg"
-
-NO_STRIP=1 linuxdeploy \
-  --appdir "$APPDIR" \
-  --executable "$APPDIR/usr/bin/emacs" \
-  --executable "$APPDIR/usr/bin/emacsclient" \
-  --desktop-file "$APPDIR/Emacs.desktop" \
-  --icon-file "$APPDIR/Emacs.svg" \
-  "${gcc_deploy_args[@]}" \
-  "${gio_deploy_args[@]}" \
-  "${webkit_deploy_args[@]}" \
-  --plugin gtk
-#+end_src
-
-Emacs looks for its portable dump before it processes ~EMACSPATH~, so that
-variable cannot relocate the compile-time ~/usr/libexec~ dump path into the
-AppDir. Its first lookup is beside the resolved executable, using the executable
-basename plus ~.pdmp~. The installation has a single fingerprinted dump under
-~usr/libexec~; expose it at that first lookup location with a relative symlink.
-Do this after linuxdeploy has finished modifying the executable.
-
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-dump_files=("$APPDIR/usr/libexec/emacs/$EMACS_VERSION/$EMACS_ARCH"/*.pdmp)
+dump_files=("$final_prefix/libexec/emacs/$EMACS_VERSION/$EMACS_ARCH"/*.pdmp)
 if ((${#dump_files[@]} != 1)); then
-    printf 'Expected one Emacs portable dump, found %d\n' "${#dump_files[@]}" >&2
+    printf 'Expected one portable dump, found %d\n' "${#dump_files[@]}" >&2
     exit 1
 fi
-emacs_binary=$(readlink -f "$APPDIR/usr/bin/emacs")
-if [[ ! -x $emacs_binary || $emacs_binary != "$APPDIR/usr/bin/"* ]]; then
-    echo 'Cannot resolve the installed Emacs executable' >&2
-    exit 1
-fi
-dump_link="$APPDIR/usr/bin/${emacs_binary##*/}.pdmp"
+emacs_binary=$(readlink -f "$final_prefix/bin/emacs")
+dump_link="$final_prefix/bin/${emacs_binary##*/}.pdmp"
 dump_target="../libexec/emacs/$EMACS_VERSION/$EMACS_ARCH/${dump_files[0]##*/}"
 ln -s "$dump_target" "$dump_link"
-#+end_src
-
-Now linuxdeploy has finished resolving ~Exec=emacs~ and we can restore the
-command intended for the installed AppImage desktop entry. The root desktop
-file is a symlink to this copy after deployment, so both locations stay
-consistent.
-
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-desktop_file="$APPDIR/usr/share/applications/Emacs.desktop"
-sed -i "s/^Exec=emacs %F$/Exec=$OUTPUT_NAME %F/" "$desktop_file"
-#+end_src
-
-The last step is to compile our custom launcher, add it as ~AppRun~, and build
-the final AppImage.
-
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-gcc-12 -std=c11 -O2 -Wall -Wextra -Werror \
-  -DEMACS_VERSION=\"$EMACS_VERSION\" \
-  -DEMACS_ARCH=\"$EMACS_ARCH\" \
-  -DSYSTEM_ARCH=\"$SYSTEM_ARCH\" \
-  -DGCC_VERSION=\"$GCC_VERSION\" \
-  -DGCC_TRIPLET=\"$GCC_TRIPLET\" \
-  "$ROOT/AppRun.c" -o "$APPDIR/AppRun"
-chmod +x "$APPDIR/AppRun"
 
 output_path="$OUTPUT_DIR/$OUTPUT_NAME"
-ARCH="$APPIMAGE_ARCH" appimagetool "$APPDIR" "$output_path"
+tar --zstd --sort=name --mtime='UTC 1970-01-01' \
+    --owner=0 --group=0 --numeric-owner \
+    -C "$BUILD_DIR/package" -cf "$output_path" "$PACKAGE_NAME"
 (
   cd "$OUTPUT_DIR"
   sha256sum "$OUTPUT_NAME" >"$OUTPUT_NAME.sha256"
@@ -590,41 +501,54 @@ ARCH="$APPIMAGE_ARCH" appimagetool "$APPDIR" "$output_path"
 printf 'Created %s/%s\n' "$OUTPUT_DIR" "$OUTPUT_NAME"
 #+end_src
 
-Smoke-check both the portable dump file is discovered correctly.
+* Verification
 
-#+begin_src bash :tangle build-appimage.sh :tangle-mode (identity #o755)
-if ! fingerprint=$("$output_path" --fingerprint); then
-    echo 'The AppImage could not load its portable dump' >&2
-    exit 1
-fi
-printf 'Portable dump fingerprint: %s\n' "$fingerprint"
-#+end_src
+Verification is part of the result rather than an installation suggestion.  The
+tracked scripts under ~.github/scripts/~ check archive integrity, the ELF
+boundary, relative RUNPATHs, relocation, portable-dump discovery, requested
+configure features, normal subprocess command selection, native compilation
+and loading, ~emacsclient~, ImageMagick decoding, and XWidget creation.
 
-* Build outputs
+The container verifier installs runtime libraries—but no compiler, libgccjit,
+or development packages—in clean Debian, Ubuntu, and Fedora images.  Ubuntu
+24.04 also represents the library baseline used by current Linux Mint.
 
-#+begin_src sh
-podman build -t emacs-appimage-builder -f Containerfile .
-podman run --rm -e EMACS_REF -e APPIMAGE_ARCH \
-  -v "$PWD:/work:Z" emacs-appimage-builder
-#+end_src
-
-The outputs are architecture-specific files such as
-~dist/Emacs-30.0.50-x86_64.AppImage~ and their matching ~.sha256~ files.
-Override ~EMACS_REF~, ~APPIMAGE_ARCH~, ~JOBS~, ~BUILD_DIR~, ~APPDIR~, or
-~OUTPUT_DIR~ with container environment variables when needed. For example,
-~-e EMACS_REF=emacs-30~ selects another branch.
-
-Verify and run the artifact with:
+Run the complete experiment locally with:
 
 #+begin_src sh
-sha256sum --check dist/Emacs-*.AppImage.sha256
-chmod +x dist/Emacs-*.AppImage
-dist/Emacs-*.AppImage
+emacs --batch --quick --eval '(require (quote org))' \
+  --eval '(org-babel-tangle-file "README.org")'
+podman build -t emacs-portable-builder -f Containerfile .
+podman run --rm -e EMACS_REF -e BUNDLE_ARCH \
+  -v "$PWD:/work" emacs-portable-builder
+.github/scripts/verify-containers.sh dist/Emacs-*.tar.zst
 #+end_src
 
-Where FUSE is unavailable, the AppImage runtime can extract itself to a
-temporary directory:
+* Installation
+
+Verify the checksum, extract the matching architecture, and add its real ~bin~
+directory to the normal user path:
 
 #+begin_src sh
-APPIMAGE_EXTRACT_AND_RUN=1 dist/Emacs-*.AppImage --quick
+sha256sum --check dist/Emacs-*.tar.zst.sha256
+mkdir -p "$HOME/.local/opt"
+tar --zstd -xf dist/Emacs-*.tar.zst -C "$HOME/.local/opt"
+prefix=$(find "$HOME/.local/opt" -maxdepth 1 -type d -name 'Emacs-*' -print -quit)
+. "$prefix/environment.sh"
+emacs
 #+end_src
+
+Source ~environment.sh~ from the shell or session that starts Emacs.  It sets
+Emacs installation paths, prepends the normal ~bin~ directory, and exports the
+bundled ImageMagick paths.  The private native-comp tool directory is added only
+while compilation workers are spawned.
+
+The host must provide the runtime GTK 3 and WebKitGTK 4.1 packages.  No host
+GCC, libgccjit, binutils, or development package is required.
+
+* Monthly builds
+
+The workflow builds x86_64 and AArch64 artifacts on the first day of every
+month, verifies each artifact in Debian, Ubuntu, and Fedora containers, and
+publishes checksummed release assets.  ~EMACS_REF~ defaults to ~master~ and can
+be overridden for a manual run.

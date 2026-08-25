@@ -1,8 +1,8 @@
-name: Weekly Emacs AppImage
+name: Monthly Emacs portable bundle
 
 on:
   schedule:
-    - cron: '17 03 * * 0'
+    - cron: '17 03 1 * *'
   workflow_dispatch:
     inputs:
       emacs_ref:
@@ -16,7 +16,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: weekly-emacs-appimage
+  group: monthly-emacs-bundle
   cancel-in-progress: false
 
 jobs:
@@ -26,9 +26,9 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-22.04
-            appimage_arch: x86_64
+            bundle_arch: x86_64
           - runner: ubuntu-24.04-arm
-            appimage_arch: aarch64
+            bundle_arch: aarch64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 360
     env:
@@ -45,25 +45,30 @@ jobs:
             --eval '(org-babel-tangle-file "README.org")'
 
       - name: Build builder image
-        run: docker build --tag emacs-appimage-builder -f Containerfile .
+        run: docker build --tag emacs-portable-builder -f Containerfile .
 
-      - name: Build Emacs AppImage
+      - name: Build Emacs portable bundle
         run: |
-          rm -rf .build AppDir dist
+          rm -rf .build* .prefix* dist*
           docker run --rm \
             -e EMACS_REF \
-            -e APPIMAGE_ARCH \
-            -v "$PWD:/work" emacs-appimage-builder
+            -e BUNDLE_ARCH \
+            -v "$PWD:/work" emacs-portable-builder
         env:
-          APPIMAGE_ARCH: ${{ matrix.appimage_arch }}
+          BUNDLE_ARCH: ${{ matrix.bundle_arch }}
 
-      - name: Upload AppImage
+      - name: Verify on Debian, Ubuntu, and Fedora
+        env:
+          CONTAINER_ENGINE: docker
+        run: .github/scripts/verify-containers.sh dist/Emacs-*.tar.zst
+
+      - name: Upload portable bundle
         uses: actions/upload-artifact@v7
         with:
-          name: emacs-appimage-${{ matrix.appimage_arch }}
+          name: emacs-portable-bundle-${{ matrix.bundle_arch }}
           path: |
-            dist/Emacs-*.AppImage
-            dist/Emacs-*.AppImage.sha256
+            dist/Emacs-*.tar.zst
+            dist/Emacs-*.tar.zst.sha256
           if-no-files-found: error
           retention-days: 90
 
@@ -77,10 +82,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Download AppImages
+      - name: Download portable bundles
         uses: actions/download-artifact@v8
         with:
-          pattern: emacs-appimage-*
+          pattern: emacs-portable-bundle-*
           path: dist
           merge-multiple: true
 
@@ -89,20 +94,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           stamp=$(date --utc +%Y%m%d-%H%M%S)
-          tag="emacs-appimage-${stamp}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          title="Emacs AppImages ${stamp}"
+          tag="emacs-bundle-${stamp}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          title="Emacs portable bundles ${stamp}"
           gh release create "$tag" \
-            dist/Emacs-*.AppImage \
-            dist/Emacs-*.AppImage.sha256 \
+            dist/Emacs-*.tar.zst \
+            dist/Emacs-*.tar.zst.sha256 \
             --target "$GITHUB_SHA" \
             --title "$title" \
-            --notes "Automated AppImage builds of Emacs ref: \`$EMACS_REF\` for x86_64 and aarch64."
+            --notes "Host-integrated portable Emacs ref \`$EMACS_REF\` for x86_64 and aarch64. Runtime requires host GTK 3 and WebKitGTK 4.1; native compilation uses the included private toolchain."
 
       - name: Prune old releases
         uses: actions/github-script@v9
         with:
           script: |
-            const prefix = "emacs-appimage-";
+            const prefix = "emacs-bundle-";
             const releases = (await github.paginate(
               github.rest.repos.listReleases,
               {
@@ -164,7 +169,7 @@ jobs:
               { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 },
             );
             for (const artifact of artifacts) {
-              if (!artifact.name.startsWith("emacs-appimage")) continue;
+              if (!artifact.name.startsWith("emacs-portable-bundle")) continue;
               if (String(artifact.workflow_run?.id) === String(context.runId)) continue;
               core.info(`Deleting superseded artifact ${artifact.id}`);
               await github.rest.actions.deleteArtifact({

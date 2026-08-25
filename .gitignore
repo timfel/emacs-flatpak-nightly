@@ -1,13 +1,10 @@
 # Files generated from README.org.
 Containerfile
 Emacs.desktop
-build-appimage.sh
-AppRun.c
+build-bundle.sh
 
 # Build trees and artifacts.
-.build/
-dist/
-AppDir/
-*.AppImage
-*.AppImage.zsync
+.build*/
+dist*/
+.prefix*/
 *.sha256
