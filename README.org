@@ -1,49 +1,44 @@
-#+TITLE: A host-integrated portable Emacs
-#+AUTHOR: Containerized Build Pipeline
+#+TITLE: A portable Emacs for modern Linux distributions
+#+AUTHOR: Tim Felgentreff
 #+PROPERTY: header-args :eval never
 
 * Objectives
 
-The result is a normal, unsandboxed build of Emacs ~master~ for current Linux
-desktops.  It has PGTK, native compilation, tree-sitter, ImageMagick, XWidgets,
-D-Bus, dynamic modules, file notifications, sound, SVG, XPM, and the common
-image formats.  It is distributed as architecture-specific ~tar.zst~ archives
-which a normal user can extract at any writable location.
+I want a portable Emacs package, built regularly from ~master~. I used to build
+Emacs locally on every machine I used and selected the features I want: PGTK,
+native compilation, tree-sitter, ImageMagick, XWidgets, D-Bus, file
+notifications, sound, SVG, XPM, and the common image formats.
 
-Six properties determine the design:
+I use immutable distributions, WSL2, and Linux on my Android phone through the
+Android Virtualization Framework, and I do not want to rebuild Emacs in all
+these places, but I get annoyed when I start using a feature on one machine and
+then switch to another where it is missing.
 
-1. Emacs and every enabled feature must be exercised after installation.
-2. One artifact per architecture must run on current Debian, Ubuntu, Linux Mint,
-   and Fedora systems.
-3. Emacs and all of its subprocesses must have ordinary host access.
-4. Installation must not require root access.
-5. Libraries, modules, helper programs, data, and the portable dump must remain
+This repository is my attempt to make this easier. I first tried Flatpak and
+then AppImage, but I always ran into problems, and the git history still
+contains some of these experiments. I finally settled on an archive of a
+prefixed installation, with some dependencies copied into it and the ELF files
+changed using ~patchelf~. Some reasons for this design:
+
+1. One artifact per architecture must run on current Debian, Ubuntu, Linux
+   Mint, and Fedora systems.
+2. Emacs and all of its subprocesses must have ordinary host access.
+3. Installation must not require root access.
+4. Libraries, modules, helper programs, data, and the portable dump must remain
    integrated after the prefix is moved.
-6. Neither Emacs nor its subprocesses may depend on ~LD_LIBRARY_PATH~,
-   ~GCC_EXEC_PREFIX~, ~COMPILER_PATH~, or ~LIBRARY_PATH~.
+5. Neither Emacs nor its subprocesses may depend on ~LD_LIBRARY_PATH~,
+   ~GCC_EXEC_PREFIX~, ~COMPILER_PATH~, ~LIBRARY_PATH~, or similar shenanigans that
+   might confuse other subprocesses.
+6. To avoid issues with system integration, use GTK from the host; this implies
+   using a bunch of other related libraries from the host as well, such as GIO,
+   WebKitGTK, Glib and quite a few more.
 
-The implementation uses Debian 12 as a glibc 2.36 baseline.  The artifact is
-portable across the supported distributions, but not across CPU architectures.
-The runtime contract requires GTK 3 and WebKitGTK 4.1 from the host.
+* The builder
 
-* Result 1: a deliberate host ABI boundary
-
-GTK and WebKit load many libraries and modules into one ELF namespace.  A
-bundled old GLib cannot safely coexist with a host libsoup built against a newer
-GLib, even though both libraries retain their SONAMEs.  The artifact therefore
-leaves the complete transitive closures of its host-facing features to the
-host.  This includes GTK, GLib, GObject, GIO, GdkPixbuf, Pango, Cairo, dconf,
-WebKitGTK, libsoup, GStreamer, common image codecs, font libraries, the graphics
-stack, Wayland, D-Bus, glibc, and any other library reached from those roots.
-
-ImageMagick's own ABI, quantum variant, modules, and configuration layout are
-less stable.  Its MagickWand/MagickCore libraries and matching modules are
-bundled, but dependencies which overlap the host platform closure are not.
-Tree-sitter and libgccjit are also private application components.  Private
-libraries live in ~lib/private~; no host-platform SONAME is allowed there.
-
-The builder supplies the oldest supported headers and all tools needed to
-construct and inspect that boundary.
+I build in Debian 12, its glibc is old enough that the binaries should work on
+current distributions, and its GTK and WebKitGTK versions are also available on
+the distributions I use. The image only contains the tools and headers needed
+to build Emacs, it is not part of the package.
 
 #+begin_src dockerfile :tangle Containerfile
 FROM debian:bookworm
@@ -65,23 +60,12 @@ WORKDIR /work
 ENTRYPOINT ["/work/build-bundle.sh"]
 #+end_src
 
-* Result 2: a relocatable native Emacs process
+* Desktop integration
 
-The installed executable is the unmodified Emacs binary, not a container
-command or custom launcher.  An ~environment.sh~ file supplies Emacs's
-relocated Lisp, data, helper, and native-Lisp directories.  The portable dump
-is exposed beside the executable under the filename Emacs checks first.
-
-ImageMagick needs process-local search paths, so ~environment.sh~ exports its
-module and configuration paths.  The private compiler path is narrower: the
-site-start file adds it only while native-compilation workers are started.  The
-normal native-compilation mode builds the required preloaded Lisp support but
-leaves the rest of the tree to compile lazily when the user first runs Emacs.
-Ordinary subprocesses retain the user's ~PATH~.  Site files are optional:
-~emacs -Q~ remains pristine and does not promise run-time native compilation.
-
-The desktop file deliberately names ~emacs~.  A user can add the extracted
-~bin~ directory to ~PATH~ or replace ~Exec~ with an absolute installation path.
+I include a desktop file in the archive, which can be symlinked into
+~~/.local/share/applications/~. It runs ~emacs~ through ~PATH~, so after
+extracting the archive I either add its ~bin~ directory to ~PATH~ or put an
+absolute path in ~Exec~.
 
 #+begin_src conf :tangle Emacs.desktop
 [Desktop Entry]
@@ -97,9 +81,13 @@ MimeType=text/plain;
 StartupWMClass=Emacs
 #+end_src
 
+* Building Emacs
 
-The build begins by selecting native architecture names and cloning the
-requested Emacs revision.
+The build script can use a different repository, revision, output directory, or
+GCC through environment variables, by default it builds the current Emacs
+~master~ for the machine where the container runs. I use the same architecture
+names for all release files, and stop early if the requested architecture does
+not match the machine.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 #!/usr/bin/env bash
@@ -145,10 +133,9 @@ git clone --depth 1 --branch "$EMACS_REF" "$EMACS_REPOSITORY" "$BUILD_DIR/emacs"
 cd "$BUILD_DIR/emacs"
 #+end_src
 
-Native Lisp shared objects do not need C startup files.  The site-start file
-therefore supplies ~-nostdlib~ to the private linker, removing any runtime
-dependency on a host ~glibc-devel~ package or distribution-specific libc linker
-script.
+Once the checkout is ready, I configure the Emacs features I want and do a
+bootstrap build, then install through ~DESTDIR~, which gives me a separate tree
+to change without touching the container's ~/usr~.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 ./autogen.sh
@@ -198,13 +185,15 @@ PACKAGE_NAME="Emacs-${EMACS_VERSION}-${BUNDLE_ARCH}"
 OUTPUT_NAME="${PACKAGE_NAME}.tar.zst"
 #+end_src
 
-* Result 3: private ImageMagick without a second platform stack
+* Bundling private libraries
 
-ImageMagick resources are normalized to stable paths inside the archive.  Only
-its own libraries, modules, and non-platform dependencies are deployed.  The
-host closure is computed from GTK, WebKitGTK, and every non-private library
-linked directly by Emacs; this makes the boundary adapt to changes in Emacs's
-configure results without maintaining a second manual codec list.
+Some dependencies are part of the package, while GTK and WebKitGTK come from
+the host, because a bundled GLib does not mix well with GTK modules from the
+host, I find all host-side dependencies and do not copy these libraries.
+
+ImageMagick is different: its libraries, modules, and configuration must match.
+I copy these files to fixed locations, together with ~libgccjit~ and
+tree-sitter, before finding the other libraries they need.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 printf 'Deploying runtime dependencies...\n'
@@ -253,7 +242,14 @@ cp -a "$magick_coders_dir"/. "$PREFIX_DIR/usr/lib/ImageMagick/coders/"
 cp -a "$magick_filters_dir"/. "$PREFIX_DIR/usr/lib/ImageMagick/filters/"
 cp -a "$magick_etc_source" "$PREFIX_DIR/usr/etc/"
 cp -a "$magick_share_source" "$PREFIX_DIR/usr/share/"
+#+end_src
 
+The installed library names come from the builder rather than being hard-coded.
+I mark ImageMagick, ~libgccjit~, and tree-sitter as private roots; everything
+linked directly by Emacs is considered part of the host unless it is one of
+those roots.
+
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 libgccjit_root=$(resolve_library libgccjit.so.0)
 tree_sitter_root=$(resolve_library libtree-sitter.so.0)
 magick_wand_soname=$(elf_soname "$magick_wand")
@@ -269,8 +265,13 @@ private_root_seen[$tree_sitter_soname]=present
 
 declare -A host_library_seen=()
 host_library_names=()
-# These ImageMagick dependencies are not part of the host GTK/WebKit ABI
-# contract and retain incompatible SONAMEs on some supported distributions.
+#+end_src
+
+A few ImageMagick dependencies have incompatible SONAMEs across the supported
+distributions and are not part of the GTK/WebKit platform, so I always keep
+these inside the archive.
+
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 declare -A forced_private_library=(
     [libbz2.so.1.0]=present
     [libfftw3.so.3]=present
@@ -306,7 +307,13 @@ for root in "${host_roots[@]}"; do
         [[ $path == /* ]] && add_host_library "$path"
     done <<<"$closure"
 done
+#+end_src
 
+When copying a private dependency, I skip it if it belongs to the host, unless
+it is one of the ImageMagick exceptions above, and I copy the real library file
+and recreate its SONAME symlink.
+
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 copy_private_library() {
     local path=$1 name=${1##*/} real real_name
     if [[ -n ${host_library_seen[$name]+present} \
@@ -352,20 +359,11 @@ while IFS= read -r -d '' module; do
 done < <(find "$PREFIX_DIR/usr/lib/ImageMagick" -type f -name '*.so*' -print0)
 #+end_src
 
-* Result 4: native compilation without compiler environment variables
+* Native compilation
 
-The private native compiler contains only the libgccjit DSO, its private
-non-platform dependencies, the target GCC driver, ~collect2~, assembler, linker,
-and the private dependencies of binutils.  Native Lisp is linked with
-~-nostdlib~, so headers, libc development files, and GCC startup objects are not
-runtime inputs.
-
-Two internal native-compilation entry points are advised: one starts synchronous
-workers and one starts queued asynchronous workers.  Each advice dynamically
-prepends the private tool directory to Lisp's ~process-environment~ only while
-Emacs creates the worker.  The worker inherits the tool path, while unrelated
-subprocesses—including an explicit host ~gcc~—do not.  No GCC search-path
-variable or global library-path variable is used.
+I want native compilation to work on machines without GCC or development
+packages, so the archive contains a small toolchain: the GCC driver,
+~collect2~, assembler, linker, and the libraries needed by these programs.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 printf 'Deploying native-compilation toolchain...\n'
@@ -407,6 +405,15 @@ for executable in "$tool_bin/as" "$tool_bin/ld"; do
     done < <(lddtree -l "$executable")
 done
 
+#+end_src
+
+Native Lisp shared objects do not need the usual C startup files, so the site
+file passes ~-nostdlib~ and points GCC at the private tools, and the host does
+not need libc development files. It changes ~PATH~ only while Emacs starts a
+native compilation worker, other subprocesses still see the user's normal
+commands, and because this is a site file, ~emacs -Q~ does not load it.
+
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 mkdir -p "$PREFIX_DIR/usr/share/emacs/site-lisp"
 cat >"$PREFIX_DIR/usr/share/emacs/site-lisp/site-start.el" <<EOF
 ;;; site-start.el --- portable native compiler setup -*- lexical-binding: t; -*-
@@ -437,12 +444,12 @@ cat >"$PREFIX_DIR/usr/share/emacs/site-lisp/site-start.el" <<EOF
 EOF
 #+end_src
 
-* Result 5: relative ELF lookup and ordinary installation
+* Making the installation relocatable
 
-Every application ELF receives a RUNPATH relative to ~$ORIGIN~ and pointing
-only at ~lib/private~.  Toolchain executables and libraries use a separate
-relative RUNPATH to their own private directory.  No ELF gets an absolute
-RUNPATH and no launcher supplies a global library path.
+There is no wrapper around Emacs, every ELF file gets a RUNPATH relative to
+~$ORIGIN~, Emacs and its tools find ~lib/private~, while the compiler tools find
+their own library directory. This works without setting ~LD_LIBRARY_PATH~ for
+programs started from Emacs.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 printf 'Patching ELF RUNPATHs and packaging archive...\n'
@@ -468,7 +475,12 @@ done < <(find "$PREFIX_DIR/usr" -type f -print0)
 while IFS= read -r -d '' elf; do
     patch_runpath "$elf" "$tool_lib"
 done < <(find "$toolchain" -type f -print0)
+#+end_src
 
+Before packaging, I check once more that none of the host libraries ended up in
+~lib/private~.
+
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 for library in "${host_library_names[@]}"; do
     [[ -n ${forced_private_library[$library]+present} ]] && continue
     if find "$private_lib" \( -type f -o -type l \) -name "$library" \
@@ -494,9 +506,15 @@ rm -rf "$BUILD_DIR/package"
 mkdir -p "$BUILD_DIR/package/$PACKAGE_NAME"
 final_prefix="$BUILD_DIR/package/$PACKAGE_NAME"
 cp -a "$PREFIX_DIR/usr"/. "$final_prefix/"
+#+end_src
 
+The result still uses the normal Emacs binary, and the ~environment.sh~ file
+sets the paths for Lisp, data, helper programs, native Lisp, and ImageMagick. It
+also adds the archive's normal ~bin~ directory to ~PATH~, but does not add the
+private compiler directory.
+
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 cat >"$final_prefix/environment.sh" <<EOF
-# Source this file before running Emacs from this prefix.
 _emacs_prefix=\$(CDPATH= cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)
 export PATH="\$_emacs_prefix/bin:\$PATH"
 export MAGICK_HOME="\$_emacs_prefix"
@@ -534,14 +552,14 @@ printf 'Created %s/%s\n' "$OUTPUT_DIR" "$OUTPUT_NAME"
 
 * Verification
 
-Verification is part of the result rather than an installation suggestion.  The
-tracked scripts under ~.github/scripts/~ check archive integrity, the ELF
-boundary, relative RUNPATHs, relocation, portable-dump discovery, requested
-configure features, normal subprocess command selection, native compilation
-and loading, ~emacsclient~, ImageMagick decoding, and XWidget creation.
+I treat verification as part of the build, and the scripts under
+~.github/scripts/~ check archive integrity, the host/private ELF boundary,
+relative RUNPATHs, relocation, portable-dump discovery, configured features,
+subprocess lookup, native compilation, ~emacsclient~, ImageMagick decoding, and
+XWidget creation.
 
 The container verifier installs runtime libraries—but no compiler, libgccjit,
-or development packages—in clean Debian, Ubuntu, and Fedora images.  Ubuntu
+or development packages—in clean Debian, Ubuntu, and Fedora images. Ubuntu
 24.04 also represents the library baseline used by current Linux Mint.
 
 Run the complete experiment locally with:
@@ -569,17 +587,17 @@ prefix=$(find "$HOME/.local/opt" -maxdepth 1 -type d -name 'Emacs-*' -print -qui
 emacs
 #+end_src
 
-Source ~environment.sh~ from the shell or session that starts Emacs.  It sets
+Source ~environment.sh~ from the shell or session that starts Emacs, it sets
 Emacs installation paths, prepends the normal ~bin~ directory, and exports the
-bundled ImageMagick paths.  The private native-comp tool directory is added only
-while compilation workers are spawned.
+bundled ImageMagick paths, while the private native-comp tool directory is only
+added when compilation workers are started.
 
-The host must provide the runtime GTK 3 and WebKitGTK 4.1 packages.  No host
+The host must provide the runtime GTK 3 and WebKitGTK 4.1 packages, but no host
 GCC, libgccjit, binutils, or development package is required.
 
 * Monthly builds
 
-The workflow builds x86_64 and AArch64 artifacts on the first day of every
-month, verifies each artifact in Debian, Ubuntu, and Fedora containers, and
-publishes checksummed release assets.  ~EMACS_REF~ defaults to ~master~ and can
-be overridden for a manual run.
+On the first day of each month GitHub Actions builds x86_64 and AArch64
+archives, verifies them in Debian, Ubuntu, and Fedora containers, and publishes
+them with checksums, while manual runs can override ~EMACS_REF~ when I want to
+test a particular Emacs revision.
