@@ -147,6 +147,7 @@ EOF
 (xwidget-webkit-new-session "about:blank")
 (sit-for 1)
 (princ "ImageMagick and XWidget checks passed\n")
+(kill-emacs 0)
 EOF
     GDK_BACKEND=x11 dbus-run-session -- xvfb-run -a \
         "$prefix/bin/emacs" -l "$work/gui.el"

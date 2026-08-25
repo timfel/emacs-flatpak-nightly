@@ -74,7 +74,9 @@ is exposed beside the executable under the filename Emacs checks first.
 
 ImageMagick needs process-local search paths, so ~environment.sh~ exports its
 module and configuration paths.  The private compiler path is narrower: the
-site-start file adds it only while native-compilation workers are started.
+site-start file adds it only while native-compilation workers are started.  The
+normal native-compilation mode builds the required preloaded Lisp support but
+leaves the rest of the tree to compile lazily when the user first runs Emacs.
 Ordinary subprocesses retain the user's ~PATH~.  Site files are optional:
 ~emacs -Q~ remains pristine and does not promise run-time native compilation.
 
@@ -102,7 +104,7 @@ requested Emacs revision.
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 #!/usr/bin/env bash
 set -euo pipefail
-trap 'status=$?; printf "build-bundle failed at line %d (status %d): %s\\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
+trap 'status=$?; printf "build-bundle failed at line %d (status %d): %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BUILD_DIR=${BUILD_DIR:-"$ROOT/.build"}
@@ -153,7 +155,7 @@ script.
 CC="$BUILD_GCC" CXX="$BUILD_GXX" ./configure \
   --prefix=/usr \
   --with-pgtk \
-  --with-native-compilation=aot \
+  --with-native-compilation \
   --with-tree-sitter \
   --with-imagemagick \
   --with-dbus \
@@ -165,20 +167,20 @@ CC="$BUILD_GCC" CXX="$BUILD_GXX" ./configure \
   --with-sound=alsa \
   CFLAGS='-O2 -g0'
 
-printf 'Building Emacs bootstrap...\\n'
+printf 'Building Emacs bootstrap...\n'
 make bootstrap
-printf 'Building Emacs...\\n'
+printf 'Building Emacs...\n'
 make -j"$JOBS" all
-printf 'Installing Emacs into %s...\\n' "$PREFIX_DIR"
+printf 'Installing Emacs into %s...\n' "$PREFIX_DIR"
 make install DESTDIR="$PREFIX_DIR"
-printf 'Emacs installation completed.\\n'
+printf 'Emacs installation completed.\n'
 #+end_src
 
 The installed version and architecture names come from the installation rather
 than assumptions about Emacs naming rules.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
-printf 'Inspecting installed Emacs...\\n'
+printf 'Inspecting installed Emacs...\n'
 shopt -s nullglob
 version_dirs=("$PREFIX_DIR"/usr/share/emacs/[0-9]*)
 if ((${#version_dirs[@]} != 1)); then
@@ -205,7 +207,7 @@ linked directly by Emacs; this makes the boundary adapt to changes in Emacs's
 configure results without maintaining a second manual codec list.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
-printf 'Deploying runtime dependencies...\\n'
+printf 'Deploying runtime dependencies...\n'
 resolve_library() {
     local soname=$1 path
     path=$(ldconfig -p | awk -v soname="$soname" '$1 == soname { print $NF; exit }')
@@ -225,6 +227,7 @@ mkdir -p "$private_lib"
 
 magick_libdir=$(pkg-config --variable=libdir MagickWand-6.Q16)
 magick_wand=$(find "$magick_libdir" -maxdepth 1 -type l -name 'libMagickWand-6.Q16.so.*' -print -quit)
+magick_core=$(find "$magick_libdir" -maxdepth 1 -type l -name 'libMagickCore-6.Q16.so.*' -print -quit)
 magick_version_dir=$(find "$magick_libdir" -maxdepth 1 -type d -name 'ImageMagick-*' -print -quit)
 magick_modules_dir=$(find "$magick_version_dir" -maxdepth 1 -type d -name 'modules-*' -print -quit)
 magick_config_dir=$(find "$magick_version_dir" -maxdepth 1 -type d -name 'config-*' -print -quit)
@@ -232,8 +235,9 @@ magick_coders_dir="$magick_modules_dir/coders"
 magick_filters_dir="$magick_modules_dir/filters"
 magick_share_source=/usr/share/ImageMagick-6
 magick_etc_source=/etc/ImageMagick-6
-for required in "$magick_wand" "$magick_config_dir" "$magick_coders_dir" \
-                "$magick_filters_dir" "$magick_share_source" "$magick_etc_source"; do
+for required in "$magick_wand" "$magick_core" "$magick_config_dir" \
+                "$magick_coders_dir" "$magick_filters_dir" "$magick_share_source" \
+                "$magick_etc_source"; do
     if [[ ! -e $required ]]; then
         printf 'Cannot locate ImageMagick resource %s\n' "$required" >&2
         exit 1
@@ -253,16 +257,27 @@ cp -a "$magick_share_source" "$PREFIX_DIR/usr/share/"
 libgccjit_root=$(resolve_library libgccjit.so.0)
 tree_sitter_root=$(resolve_library libtree-sitter.so.0)
 magick_wand_soname=$(elf_soname "$magick_wand")
+magick_core_soname=$(elf_soname "$magick_core")
 libgccjit_soname=$(elf_soname "$libgccjit_root")
 tree_sitter_soname=$(elf_soname "$tree_sitter_root")
 
 declare -A private_root_seen=()
 private_root_seen[$magick_wand_soname]=present
+private_root_seen[$magick_core_soname]=present
 private_root_seen[$libgccjit_soname]=present
 private_root_seen[$tree_sitter_soname]=present
 
 declare -A host_library_seen=()
 host_library_names=()
+# These ImageMagick dependencies are not part of the host GTK/WebKit ABI
+# contract and retain incompatible SONAMEs on some supported distributions.
+declare -A forced_private_library=(
+    [libbz2.so.1.0]=present
+    [libfftw3.so.3]=present
+    [libgomp.so.1]=present
+    [liblqr-1.so.0]=present
+    [libltdl.so.7]=present
+)
 add_host_library() {
     local path=$1 name=${1##*/}
     if [[ -z ${host_library_seen[$name]+present} ]]; then
@@ -294,7 +309,10 @@ done
 
 copy_private_library() {
     local path=$1 name=${1##*/} real real_name
-    [[ -n ${host_library_seen[$name]+present} ]] && return
+    if [[ -n ${host_library_seen[$name]+present} \
+          && -z ${forced_private_library[$name]+present} ]]; then
+        return
+    fi
     real=$(readlink -f "$path")
     [[ -f $real ]] || { printf 'Cannot copy dependency %s\n' "$path" >&2; exit 1; }
     real_name=${real##*/}
@@ -326,6 +344,7 @@ deploy_private_root() {
 }
 
 deploy_private_root "$magick_wand"
+deploy_private_root "$magick_core"
 deploy_private_root "$libgccjit_root"
 deploy_private_root "$tree_sitter_root"
 while IFS= read -r -d '' module; do
@@ -349,7 +368,7 @@ subprocesses—including an explicit host ~gcc~—do not.  No GCC search-path
 variable or global library-path variable is used.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
-printf 'Deploying native-compilation toolchain...\\n'
+printf 'Deploying native-compilation toolchain...\n'
 toolchain="$PREFIX_DIR/usr/libexec/native-comp"
 tool_bin="$toolchain/bin"
 tool_lib="$toolchain/lib"
@@ -426,7 +445,7 @@ relative RUNPATH to their own private directory.  No ELF gets an absolute
 RUNPATH and no launcher supplies a global library path.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
-printf 'Patching ELF RUNPATHs and packaging archive...\\n'
+printf 'Patching ELF RUNPATHs and packaging archive...\n'
 patch_runpath() {
     local elf=$1 destination=$2 relative runpath type
     if ! type=$(readelf -h "$elf" 2>/dev/null | awk '/Type:/ { print $2; exit }'); then
@@ -451,6 +470,7 @@ while IFS= read -r -d '' elf; do
 done < <(find "$toolchain" -type f -print0)
 
 for library in "${host_library_names[@]}"; do
+    [[ -n ${forced_private_library[$library]+present} ]] && continue
     if find "$private_lib" \( -type f -o -type l \) -name "$library" \
             -print -quit | grep -q .; then
         printf 'Host platform library was bundled unexpectedly: %s\n' "$library" >&2
