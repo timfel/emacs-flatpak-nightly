@@ -38,8 +38,8 @@ private_lib="$prefix/lib/private"
 for forbidden in libgtk-3.so.0 libglib-2.0.so.0 libgio-2.0.so.0 \
                  libgobject-2.0.so.0 libpango-1.0.so.0 libcairo.so.2 \
                  libgdk_pixbuf-2.0.so.0 libwebkit2gtk-4.1.so.0 \
-                 libsoup-3.0.so.0 libpng16.so.16 libjpeg.so.62 \
-                 libstdc++.so.6 libgcc_s.so.1; do
+                 libsoup-3.0.so.0 libpng16.so.16 libstdc++.so.6 \
+                 libgcc_s.so.1; do
     if find "$private_lib" \( -type f -o -type l \) -name "$forbidden" \
             -print -quit | grep -q .; then
         printf 'Forbidden host library is present: %s\n' "$forbidden" >&2

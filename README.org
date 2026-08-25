@@ -269,13 +269,15 @@ host_library_names=()
 
 A few ImageMagick dependencies have incompatible SONAMEs across the supported
 distributions and are not part of the GTK/WebKit platform, so I always keep
-these inside the archive.
+these inside the archive.  This includes libjpeg: Debian Bookworm provides
+~libjpeg.so.62~, whereas Ubuntu 24.04 provides ~libjpeg.so.8~.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 declare -A forced_private_library=(
     [libbz2.so.1.0]=present
     [libfftw3.so.3]=present
     [libgomp.so.1]=present
+    [libjpeg.so.62]=present
     [liblqr-1.so.0]=present
     [libltdl.so.7]=present
 )
