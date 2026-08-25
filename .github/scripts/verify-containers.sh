@@ -36,8 +36,8 @@ run_case docker.io/library/ubuntu:24.04 '
     binutils coreutils dbus-x11 file findutils grep sed tar zstd xauth xvfb \
     libacl1 libasound2t64 libattr1 libbz2-1.0 libcairo2 libdbus-1-3 \
     libfontconfig1 libfreetype6 libgdk-pixbuf-2.0-0 libgif7 libgmp10 libgnutls30t64 libgpm2 \
-    libgtk-3-0t64 libharfbuzz0b libjpeg-turbo8 liblcms2-2 libotf1 libpng16-16 \
-    librsvg2-2 libselinux1 libsqlite3-0t64 libsystemd0 libtiff6 libtinfo6 \
+    libgtk-3-0t64 libharfbuzz0b libjpeg-turbo8 liblcms2-2 libotf1 libpng16-16t64 \
+    librsvg2-2 libselinux1 libsqlite3-0 libsystemd0 libtiff6 libtinfo6 \
     libtree-sitter0 libwebkit2gtk-4.1-0 libwebp7 libwebpdemux2 libxml2 \
     zlib1g libzstd1 >/dev/null'
 
