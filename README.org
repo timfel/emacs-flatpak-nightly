@@ -102,6 +102,7 @@ requested Emacs revision.
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'status=$?; printf "build-bundle failed at line %d (status %d): %s\\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BUILD_DIR=${BUILD_DIR:-"$ROOT/.build"}
@@ -164,15 +165,20 @@ CC="$BUILD_GCC" CXX="$BUILD_GXX" ./configure \
   --with-sound=alsa \
   CFLAGS='-O2 -g0'
 
+printf 'Building Emacs bootstrap...\\n'
 make bootstrap
+printf 'Building Emacs...\\n'
 make -j"$JOBS" all
+printf 'Installing Emacs into %s...\\n' "$PREFIX_DIR"
 make install DESTDIR="$PREFIX_DIR"
+printf 'Emacs installation completed.\\n'
 #+end_src
 
 The installed version and architecture names come from the installation rather
 than assumptions about Emacs naming rules.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
+printf 'Inspecting installed Emacs...\\n'
 shopt -s nullglob
 version_dirs=("$PREFIX_DIR"/usr/share/emacs/[0-9]*)
 if ((${#version_dirs[@]} != 1)); then
@@ -199,6 +205,7 @@ linked directly by Emacs; this makes the boundary adapt to changes in Emacs's
 configure results without maintaining a second manual codec list.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
+printf 'Deploying runtime dependencies...\\n'
 resolve_library() {
     local soname=$1 path
     path=$(ldconfig -p | awk -v soname="$soname" '$1 == soname { print $NF; exit }')
@@ -342,6 +349,7 @@ subprocesses—including an explicit host ~gcc~—do not.  No GCC search-path
 variable or global library-path variable is used.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
+printf 'Deploying native-compilation toolchain...\\n'
 toolchain="$PREFIX_DIR/usr/libexec/native-comp"
 tool_bin="$toolchain/bin"
 tool_lib="$toolchain/lib"
@@ -418,6 +426,7 @@ relative RUNPATH to their own private directory.  No ELF gets an absolute
 RUNPATH and no launcher supplies a global library path.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
+printf 'Patching ELF RUNPATHs and packaging archive...\\n'
 patch_runpath() {
     local elf=$1 destination=$2 relative runpath type
     type=$(readelf -h "$elf" 2>/dev/null | awk '/Type:/ { print $2; exit }')
