@@ -48,7 +48,9 @@ for forbidden in libgtk-3.so.0 libglib-2.0.so.0 libgio-2.0.so.0 \
 done
 
 while IFS= read -r -d '' elf; do
-    type=$(readelf -h "$elf" 2>/dev/null | awk '/Type:/ { print $2; exit }')
+    if ! type=$(readelf -h "$elf" 2>/dev/null | awk '/Type:/ { print $2; exit }'); then
+        continue
+    fi
     [[ $type == DYN || $type == EXEC ]] || continue
     dynamic=$(readelf -d "$elf")
     if grep -q '(RPATH)' <<<"$dynamic"; then

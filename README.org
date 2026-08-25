@@ -429,8 +429,10 @@ RUNPATH and no launcher supplies a global library path.
 printf 'Patching ELF RUNPATHs and packaging archive...\\n'
 patch_runpath() {
     local elf=$1 destination=$2 relative runpath type
-    type=$(readelf -h "$elf" 2>/dev/null | awk '/Type:/ { print $2; exit }')
-    [[ $type == DYN || $type == EXEC ]] || return
+    if ! type=$(readelf -h "$elf" 2>/dev/null | awk '/Type:/ { print $2; exit }'); then
+        return 0
+    fi
+    [[ $type == DYN || $type == EXEC ]] || return 0
     relative=$(realpath --relative-to="$(dirname "$elf")" "$destination")
     if [[ $relative == . ]]; then
         runpath='$ORIGIN'
