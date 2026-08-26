@@ -5,9 +5,9 @@
 * Objectives
 
 I want a portable Emacs package, built regularly from ~master~. I used to build
-Emacs locally on every machine I used and selected the features I want: PGTK,
-native compilation, tree-sitter, ImageMagick, XWidgets, D-Bus, file
-notifications, sound, SVG, XPM, and the common image formats.
+Emacs locally on every machine I used and selected the features I want: a
+Lucid X11 GUI, native compilation, tree-sitter, ImageMagick, file
+notifications, sound, XPM, and the common image formats.
 
 I use immutable distributions, WSL2, and Linux on my Android phone through the
 Android Virtualization Framework, and I do not want to rebuild Emacs in all
@@ -29,16 +29,16 @@ changed using ~patchelf~. Some reasons for this design:
 5. Neither Emacs nor its subprocesses may depend on ~LD_LIBRARY_PATH~,
    ~GCC_EXEC_PREFIX~, ~COMPILER_PATH~, ~LIBRARY_PATH~, or similar shenanigans that
    might confuse other subprocesses.
-6. To avoid issues with system integration, use GTK from the host; this implies
-   using a bunch of other related libraries from the host as well, such as GIO,
-   WebKitGTK, Glib and quite a few more.
+6. Bundle the complete non-glibc library closure.  The host boundary is the
+   kernel, glibc, the X server, and system data such as fonts, certificates,
+   locales, and timezone information.
 
 * The builder
 
-I build in Debian 12, its glibc is old enough that the binaries should work on
-current distributions, and its GTK and WebKitGTK versions are also available on
-the distributions I use. The image only contains the tools and headers needed
-to build Emacs, it is not part of the package.
+We build on Debian 12.  Its glibc 2.36 is the oldest runtime ABI required by
+these archives.  The Lucid X11 client stack and every other non-glibc shared
+library are copied from this builder, so the target distribution does not need
+to provide matching GUI or feature libraries.
 
 #+begin_src dockerfile :tangle Containerfile
 FROM debian:bookworm
@@ -47,13 +47,13 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       autoconf automake binutils build-essential ca-certificates file git \
-      libacl1-dev libasound2-dev libdbus-1-dev libgif-dev libgnutls28-dev \
-      libgpm-dev libgtk-3-dev libharfbuzz-dev libjpeg-dev \
-      libmagickwand-dev libncurses-dev libotf-dev libpng-dev librsvg2-dev \
-      libselinux1-dev libsqlite3-dev libsystemd-dev libtiff-dev \
-      libtree-sitter-dev libwebkit2gtk-4.1-dev libwebp-dev libxpm-dev \
-      libxml2-dev libgccjit-12-dev gcc-12 g++-12 make patchelf pkg-config \
-      python3 pax-utils texinfo zstd \
+      libacl1-dev libasound2-dev libcairo2-dev libgif-dev libgnutls28-dev \
+      libgpm-dev libharfbuzz-dev libjpeg-dev libmagickwand-dev \
+      libncurses-dev libotf-dev libpng-dev libsqlite3-dev libtiff-dev \
+      libtree-sitter-dev libwebp-dev libx11-dev libxaw7-dev libxext-dev \
+      libxft-dev libxmu-dev libxpm-dev libxrender-dev libxt-dev libxml2-dev \
+      libgccjit-12-dev gcc-12 g++-12 make patchelf pkg-config python3 \
+      pax-utils texinfo zstd \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
@@ -141,17 +141,25 @@ to change without touching the container's ~/usr~.
 ./autogen.sh
 CC="$BUILD_GCC" CXX="$BUILD_GXX" ./configure \
   --prefix=/usr \
-  --with-pgtk \
+  --with-x \
+  --with-x-toolkit=lucid \
+  --with-cairo \
+  --with-xft \
   --with-native-compilation \
   --with-tree-sitter \
   --with-imagemagick \
-  --with-dbus \
   --with-file-notification=inotify \
-  --with-xwidgets \
   --with-modules \
-  --with-rsvg \
   --with-xpm \
   --with-sound=alsa \
+  --without-pgtk \
+  --without-dbus \
+  --without-gsettings \
+  --without-gconf \
+  --without-xwidgets \
+  --without-rsvg \
+  --without-libsystemd \
+  --without-selinux \
   CFLAGS='-O2 -g0'
 
 printf 'Building Emacs bootstrap...\n'
@@ -187,26 +195,19 @@ OUTPUT_NAME="${PACKAGE_NAME}.tar.zst"
 
 * Bundling private libraries
 
-Some dependencies are part of the package, while GTK and WebKitGTK come from
-the host, because a bundled GLib does not mix well with GTK modules from the
-host, I find all host-side dependencies and do not copy these libraries.
+The archive follows an auditwheel-style policy: glibc and its closely coupled
+loader, NSS, resolver, and threading libraries come from the host; every other
+shared-library dependency comes from the builder.  This includes the complete
+Lucid/X11 client stack.  The build runs on the oldest supported glibc and never
+bundles the dynamic loader or glibc implementation libraries.
 
-ImageMagick is different: its libraries, modules, and configuration must match.
-I copy these files to fixed locations, together with ~libgccjit~ and
-tree-sitter, before finding the other libraries they need.
+ImageMagick also loads modules and configuration that are not represented by
+ELF ~DT_NEEDED~ entries, so its coders, filters, and data are copied explicitly.
+Those module ELFs are then dependency roots alongside all installed Emacs
+executables and modules.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 printf 'Deploying runtime dependencies...\n'
-resolve_library() {
-    local soname=$1 path
-    path=$(ldconfig -p | awk -v soname="$soname" '$1 == soname { print $NF; exit }')
-    if [[ -z $path || ! -e $path ]]; then
-        printf 'Cannot find required library %s\n' "$soname" >&2
-        exit 1
-    fi
-    printf '%s\n' "$path"
-}
-
 elf_soname() {
     readelf -d "$1" | awk -F'[][]' '/SONAME/ { print $2; exit }'
 }
@@ -215,8 +216,6 @@ private_lib="$PREFIX_DIR/usr/lib/private"
 mkdir -p "$private_lib"
 
 magick_libdir=$(pkg-config --variable=libdir MagickWand-6.Q16)
-magick_wand=$(find "$magick_libdir" -maxdepth 1 -type l -name 'libMagickWand-6.Q16.so.*' -print -quit)
-magick_core=$(find "$magick_libdir" -maxdepth 1 -type l -name 'libMagickCore-6.Q16.so.*' -print -quit)
 magick_version_dir=$(find "$magick_libdir" -maxdepth 1 -type d -name 'ImageMagick-*' -print -quit)
 magick_modules_dir=$(find "$magick_version_dir" -maxdepth 1 -type d -name 'modules-*' -print -quit)
 magick_config_dir=$(find "$magick_version_dir" -maxdepth 1 -type d -name 'config-*' -print -quit)
@@ -224,9 +223,8 @@ magick_coders_dir="$magick_modules_dir/coders"
 magick_filters_dir="$magick_modules_dir/filters"
 magick_share_source=/usr/share/ImageMagick-6
 magick_etc_source=/etc/ImageMagick-6
-for required in "$magick_wand" "$magick_core" "$magick_config_dir" \
-                "$magick_coders_dir" "$magick_filters_dir" "$magick_share_source" \
-                "$magick_etc_source"; do
+for required in "$magick_config_dir" "$magick_coders_dir" \
+                "$magick_filters_dir" "$magick_share_source" "$magick_etc_source"; do
     if [[ ! -e $required ]]; then
         printf 'Cannot locate ImageMagick resource %s\n' "$required" >&2
         exit 1
@@ -242,102 +240,79 @@ cp -a "$magick_coders_dir"/. "$PREFIX_DIR/usr/lib/ImageMagick/coders/"
 cp -a "$magick_filters_dir"/. "$PREFIX_DIR/usr/lib/ImageMagick/filters/"
 cp -a "$magick_etc_source" "$PREFIX_DIR/usr/etc/"
 cp -a "$magick_share_source" "$PREFIX_DIR/usr/share/"
-#+end_src
 
-The installed library names come from the builder rather than being hard-coded.
-I mark ImageMagick, ~libgccjit~, and tree-sitter as private roots; everything
-linked directly by Emacs is considered part of the host unless it is one of
-those roots.
-
-#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
-libgccjit_root=$(resolve_library libgccjit.so.0)
-tree_sitter_root=$(resolve_library libtree-sitter.so.0)
-magick_wand_soname=$(elf_soname "$magick_wand")
-magick_core_soname=$(elf_soname "$magick_core")
-libgccjit_soname=$(elf_soname "$libgccjit_root")
-tree_sitter_soname=$(elf_soname "$tree_sitter_root")
-
-declare -A private_root_seen=()
-private_root_seen[$magick_wand_soname]=present
-private_root_seen[$magick_core_soname]=present
-private_root_seen[$libgccjit_soname]=present
-private_root_seen[$tree_sitter_soname]=present
-
-declare -A host_library_seen=()
-host_library_names=()
-#+end_src
-
-A few ImageMagick dependencies have incompatible SONAMEs across the supported
-distributions and are not part of the GTK/WebKit platform, so I always keep
-these inside the archive.  This includes libjpeg: Debian Bookworm provides
-~libjpeg.so.62~, whereas Ubuntu 24.04 provides ~libjpeg.so.8~.
-
-#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
-declare -A forced_private_library=(
-    [libbz2.so.1.0]=present
-    [libfftw3.so.3]=present
-    [libgomp.so.1]=present
-    [libjpeg.so.62]=present
-    [liblqr-1.so.0]=present
-    [libltdl.so.7]=present
-)
-add_host_library() {
-    local path=$1 name=${1##*/}
-    if [[ -z ${host_library_seen[$name]+present} ]]; then
-        host_library_seen[$name]=present
-        host_library_names+=("$name")
+# Debian's optional Pango ImageMagick coder pulls GIO into an otherwise
+# self-contained image stack.  Remove any module that reaches a platform
+# library deliberately excluded from this build.
+for module in "$PREFIX_DIR/usr/lib/ImageMagick"/{coders,filters}/*.so; do
+    [[ -e $module ]] || continue
+    removed=false
+    while IFS= read -r dependency; do
+        case "${dependency##*/}" in
+            libdbus-1.so.*|libgio-2.0.so.*|libgtk-*.so.*|librsvg-*.so.*|\
+            libwebkit2gtk-*.so.*)
+                removed=true
+                break ;;
+        esac
+    done < <(lddtree -l "$module")
+    if $removed; then
+        rm -f "${module%.so}.la" "$module"
     fi
+done
+#+end_src
+
+The dependency scanner starts at every installed ELF, including ImageMagick
+modules, and recursively copies each resolved dependency.  It skips only the
+explicit glibc-family allowlist.  Both the real filename and its SONAME are
+installed, and collisions fail the build rather than silently selecting one
+implementation.
+
+#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
+is_host_glibc() {
+    local name=${1##*/}
+    case "$name" in
+        ld-linux*.so.*|ld64.so.*|libc.so.*|libm.so.*|libmvec.so.*|\
+        libdl.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|libutil.so.*|\
+        libanl.so.*|libBrokenLocale.so.*|libnss_*.so.*|libthread_db.so.*)
+            return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
-host_roots=(libgtk-3.so.0 libwebkit2gtk-4.1.so.0)
-for executable in "$PREFIX_DIR/usr/bin/emacs" "$PREFIX_DIR/usr/bin/emacsclient"; do
-    while IFS= read -r name; do
-        [[ -n ${private_root_seen[$name]+present} ]] || host_roots+=("$name")
-    done < <(readelf -d "$executable" | awk -F'[][]' '/NEEDED/ { print $2 }')
-done
-
-declare -A host_root_seen=()
-for root in "${host_roots[@]}"; do
-    [[ -n ${host_root_seen[$root]+present} ]] && continue
-    host_root_seen[$root]=present
-    root_path=$(resolve_library "$root")
-    if ! closure=$(lddtree -l "$root_path"); then
-        printf 'Cannot compute host dependency closure for %s\n' "$root" >&2
-        exit 1
-    fi
-    while IFS= read -r path; do
-        [[ $path == /* ]] && add_host_library "$path"
-    done <<<"$closure"
-done
-#+end_src
-
-When copying a private dependency, I skip it if it belongs to the host, unless
-it is one of the ImageMagick exceptions above, and I copy the real library file
-and recreate its SONAME symlink.
-
-#+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 copy_private_library() {
-    local path=$1 name=${1##*/} real real_name
-    if [[ -n ${host_library_seen[$name]+present} \
-          && -z ${forced_private_library[$name]+present} ]]; then
-        return
-    fi
+    local path=$1 name=${1##*/} real real_name soname link destination
+    is_host_glibc "$name" && return
     real=$(readlink -f "$path")
     [[ -f $real ]] || { printf 'Cannot copy dependency %s\n' "$path" >&2; exit 1; }
     real_name=${real##*/}
-    if [[ ! -e $private_lib/$real_name ]]; then
-        cp -a "$real" "$private_lib/$real_name"
+    destination="$private_lib/$real_name"
+    if [[ -e $destination ]]; then
+        if ! cmp -s "$real" "$destination"; then
+            printf 'Conflicting private library filename: %s\n' "$real_name" >&2
+            exit 1
+        fi
+    else
+        cp -a "$real" "$destination"
     fi
-    if [[ $name != "$real_name" && ! -e $private_lib/$name ]]; then
-        ln -s "$real_name" "$private_lib/$name"
-    fi
+    soname=$(elf_soname "$real")
+    for link in "$name" "$soname"; do
+        [[ -n $link && $link != "$real_name" ]] || continue
+        if [[ -e $private_lib/$link || -L $private_lib/$link ]]; then
+            if [[ $(readlink -f "$private_lib/$link") != "$destination" ]]; then
+                printf 'Conflicting private library SONAME: %s\n' "$link" >&2
+                exit 1
+            fi
+        else
+            ln -s "$real_name" "$private_lib/$link"
+        fi
+    done
 }
 
 deploy_private_dependencies() {
-    local root=$1 root_real path
+    local root=$1 root_real path closure
     root_real=$(readlink -f "$root")
     if ! closure=$(lddtree -l "$root"); then
-        printf 'Cannot compute private dependency closure for %s\n' "$root" >&2
+        printf 'Cannot compute dependency closure for %s\n' "$root" >&2
         exit 1
     fi
     while IFS= read -r path; do
@@ -347,18 +322,11 @@ deploy_private_dependencies() {
     done <<<"$closure"
 }
 
-deploy_private_root() {
-    copy_private_library "$1"
-    deploy_private_dependencies "$1"
-}
-
-deploy_private_root "$magick_wand"
-deploy_private_root "$magick_core"
-deploy_private_root "$libgccjit_root"
-deploy_private_root "$tree_sitter_root"
-while IFS= read -r -d '' module; do
-    deploy_private_dependencies "$module"
-done < <(find "$PREFIX_DIR/usr/lib/ImageMagick" -type f -name '*.so*' -print0)
+while IFS= read -r -d '' elf; do
+    if readelf -h "$elf" >/dev/null 2>&1; then
+        deploy_private_dependencies "$elf"
+    fi
+done < <(find "$PREFIX_DIR/usr" -type f -print0)
 #+end_src
 
 * Native compilation
@@ -385,10 +353,7 @@ install -m755 "$($BUILD_GCC -print-prog-name=collect2)" "$tool_gcc/collect2"
 declare -A tool_library_seen=()
 copy_tool_library() {
     local path=$1 name=${1##*/} real real_name
-    case "$name" in
-        ld-linux*.so.*|libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*)
-            return ;;
-    esac
+    is_host_glibc "$name" && return
     real=$(readlink -f "$path")
     [[ -f $real ]] || return
     real_name=${real##*/}
@@ -401,7 +366,8 @@ copy_tool_library() {
     fi
 }
 
-for executable in "$tool_bin/as" "$tool_bin/ld"; do
+for executable in "$tool_bin/$GCC_TRIPLET-gcc-$GCC_VERSION" \
+                  "$tool_bin/as" "$tool_bin/ld" "$tool_gcc/collect2"; do
     while IFS= read -r path; do
         [[ $path == /* ]] && copy_tool_library "$path"
     done < <(lddtree -l "$executable")
@@ -479,18 +445,41 @@ while IFS= read -r -d '' elf; do
 done < <(find "$toolchain" -type f -print0)
 #+end_src
 
-Before packaging, I check once more that none of the host libraries ended up in
-~lib/private~.
+Before packaging, I verify the policy in both directions: glibc implementation
+libraries must not be present, and every other ~DT_NEEDED~ name must resolve in
+the corresponding private directory.  Libraries from the removed GTK/GIO,
+D-Bus, WebKit, and librsvg stacks are rejected explicitly.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
-for library in "${host_library_names[@]}"; do
-    [[ -n ${forced_private_library[$library]+present} ]] && continue
-    if find "$private_lib" \( -type f -o -type l \) -name "$library" \
-            -print -quit | grep -q .; then
-        printf 'Host platform library was bundled unexpectedly: %s\n' "$library" >&2
+for library in "$private_lib"/* "$tool_lib"/*; do
+    [[ -e $library || -L $library ]] || continue
+    if is_host_glibc "${library##*/}"; then
+        printf 'Host glibc library was bundled unexpectedly: %s\n' "${library##*/}" >&2
         exit 1
     fi
 done
+
+for forbidden in libdbus-1.so.* libgio-2.0.so.* libgtk-*.so.* \
+                 librsvg-*.so.* libwebkit2gtk-*.so.*; do
+    if compgen -G "$private_lib/$forbidden" >/dev/null; then
+        printf 'Removed platform library was bundled unexpectedly: %s\n' "$forbidden" >&2
+        exit 1
+    fi
+done
+
+while IFS= read -r -d '' elf; do
+    readelf -h "$elf" >/dev/null 2>&1 || continue
+    dependency_dir=$private_lib
+    [[ $elf == "$toolchain/"* ]] && dependency_dir=$tool_lib
+    while IFS= read -r needed; do
+        is_host_glibc "$needed" && continue
+        if [[ ! -e $dependency_dir/$needed ]]; then
+            printf 'Bundled dependency %s required by %s is missing\n' \
+                "$needed" "$elf" >&2
+            exit 1
+        fi
+    done < <(readelf -d "$elf" | awk -F'[][]' '/NEEDED/ { print $2 }')
+done < <(find "$PREFIX_DIR/usr" -type f -print0)
 
 icon=$(find "$PREFIX_DIR/usr/share/icons" -type f -name emacs.svg -print -quit)
 [[ -n $icon ]] || { echo 'The Emacs installation did not contain emacs.svg' >&2; exit 1; }
@@ -558,11 +547,12 @@ I treat verification as part of the build, and the scripts under
 ~.github/scripts/~ check archive integrity, the host/private ELF boundary,
 relative RUNPATHs, relocation, portable-dump discovery, configured features,
 subprocess lookup, native compilation, ~emacsclient~, ImageMagick decoding, and
-XWidget creation.
+a Lucid X11 frame.
 
-The container verifier installs runtime libraries—but no compiler, libgccjit,
-or development packages—in clean Debian, Ubuntu, and Fedora images. Ubuntu
-24.04 also represents the library baseline used by current Linux Mint.
+The container verifier installs archive inspection tools and Xvfb—but no Emacs
+runtime libraries, compiler, libgccjit, or development packages—in clean
+Debian, Ubuntu, and Fedora images. Ubuntu 24.04 also represents current Linux
+Mint.
 
 Run the complete experiment locally with:
 
@@ -594,8 +584,8 @@ Emacs installation paths, prepends the normal ~bin~ directory, and exports the
 bundled ImageMagick paths, while the private native-comp tool directory is only
 added when compilation workers are started.
 
-The host must provide the runtime GTK 3 and WebKitGTK 4.1 packages, but no host
-GCC, libgccjit, binutils, or development package is required.
+The host must provide glibc 2.36 or newer and an X server, but no host GUI
+library, GCC, libgccjit, binutils, or development package is required.
 
 * Monthly builds
 

@@ -35,14 +35,30 @@ export PATH="$work/host-bin:/usr/local/bin:/usr/bin:/bin"
 source "$prefix/environment.sh"
 
 private_lib="$prefix/lib/private"
-for forbidden in libgtk-3.so.0 libglib-2.0.so.0 libgio-2.0.so.0 \
-                 libgobject-2.0.so.0 libpango-1.0.so.0 libcairo.so.2 \
-                 libgdk_pixbuf-2.0.so.0 libwebkit2gtk-4.1.so.0 \
-                 libsoup-3.0.so.0 libpng16.so.16 libstdc++.so.6 \
-                 libgcc_s.so.1; do
-    if find "$private_lib" \( -type f -o -type l \) -name "$forbidden" \
-            -print -quit | grep -q .; then
-        printf 'Forbidden host library is present: %s\n' "$forbidden" >&2
+toolchain="$prefix/libexec/native-comp"
+tool_lib="$toolchain/lib"
+is_host_glibc() {
+    local name=${1##*/}
+    case "$name" in
+        ld-linux*.so.*|ld64.so.*|libc.so.*|libm.so.*|libmvec.so.*|\
+        libdl.so.*|libpthread.so.*|librt.so.*|libresolv.so.*|libutil.so.*|\
+        libanl.so.*|libBrokenLocale.so.*|libnss_*.so.*|libthread_db.so.*)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+for library in "$private_lib"/* "$tool_lib"/*; do
+    [[ -e $library || -L $library ]] || continue
+    if is_host_glibc "${library##*/}"; then
+        printf 'Host glibc library is present: %s\n' "${library##*/}" >&2
+        exit 1
+    fi
+done
+for forbidden in libdbus-1.so.* libgio-2.0.so.* libgtk-*.so.* \
+                 librsvg-*.so.* libwebkit2gtk-*.so.*; do
+    if compgen -G "$private_lib/$forbidden" >/dev/null; then
+        printf 'Removed platform library is present: %s\n' "$forbidden" >&2
         exit 1
     fi
 done
@@ -62,6 +78,16 @@ while IFS= read -r -d '' elf; do
         printf 'Non-relative RUNPATH in %s: %s\n' "$elf" "$runpath" >&2
         exit 1
     fi
+    dependency_dir=$private_lib
+    [[ $elf == "$toolchain/"* ]] && dependency_dir=$tool_lib
+    while IFS= read -r needed; do
+        is_host_glibc "$needed" && continue
+        if [[ ! -e $dependency_dir/$needed ]]; then
+            printf 'Bundled dependency %s required by %s is missing\n' \
+                "$needed" "$elf" >&2
+            exit 1
+        fi
+    done < <(awk -F'[][]' '/NEEDED/ { print $2 }' <<<"$dynamic")
 done < <(find "$prefix" -type f -print0)
 
 for forbidden in LD_LIBRARY_PATH GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH; do
@@ -81,17 +107,20 @@ cat >"$work/smoke.el" <<'EOF'
 EOF
 cat >"$work/verify.el" <<EOF
 ;;; -*- lexical-binding: t; -*-
-(let ((required '("--with-pgtk" "--with-native-compilation" "--with-tree-sitter"
-                  "--with-imagemagick" "--with-xwidgets" "--with-dbus"
-                  "--with-modules" "--with-rsvg" "--with-xpm")))
+(let ((required '("--with-x-toolkit=lucid" "--with-native-compilation"
+                  "--with-tree-sitter" "--with-imagemagick"
+                  "--with-modules" "--with-xpm"))
+      (forbidden '("--with-pgtk" "--with-dbus" "--with-xwidgets"
+                   "--with-rsvg" "--with-libsystemd" "--with-selinux")))
   (dolist (option required)
     (unless (string-match-p (regexp-quote option) system-configuration-options)
-      (error "Missing configure feature: %s" option))))
+      (error "Missing configure feature: %s" option)))
+  (dolist (option forbidden)
+    (when (string-match-p (regexp-quote option) system-configuration-options)
+      (error "Removed configure feature is enabled: %s" option))))
 (unless (native-comp-available-p) (error "Native compilation is unavailable"))
 (unless (image-type-available-p 'imagemagick) (error "ImageMagick is unavailable"))
 (unless (treesit-available-p) (error "Tree-sitter is unavailable"))
-(require 'xwidget)
-(unless (fboundp 'xwidget-webkit-new-session) (error "XWidgets are unavailable"))
 (dolist (name '("GCC_EXEC_PREFIX" "COMPILER_PATH" "LIBRARY_PATH"
                 "LD_LIBRARY_PATH"))
   (when (getenv name) (error "%s is present in process-environment" name)))
@@ -133,24 +162,26 @@ done
     --eval '(kill-emacs)' >/dev/null
 daemon_started=false
 
-if command -v xvfb-run >/dev/null 2>&1; then
-    base64 -d >"$work/pixel.png" <<'EOF'
+command -v xvfb-run >/dev/null 2>&1 || {
+    echo 'xvfb-run is required for Lucid GUI verification' >&2
+    exit 1
+}
+base64 -d >"$work/pixel.png" <<'EOF'
 iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=
 EOF
-    cat >"$work/gui.el" <<EOF
+cat >"$work/gui.el" <<EOF
 ;;; -*- lexical-binding: t; -*-
 (let* ((image (create-image "$work/pixel.png" 'imagemagick nil))
        (size (image-size image t)))
   (unless (and (> (car size) 0) (> (cdr size) 0))
     (error "ImageMagick did not decode the test image")))
-(require 'xwidget)
-(xwidget-webkit-new-session "about:blank")
-(sit-for 1)
-(princ "ImageMagick and XWidget checks passed\n")
+(unless (eq window-system 'x)
+  (error "Lucid build did not create an X frame: %S" window-system))
+(unless (member "LUCID" (split-string system-configuration-features))
+  (error "The running GUI does not report the Lucid toolkit"))
+(princ "ImageMagick and Lucid X11 checks passed\n")
 (kill-emacs 0)
 EOF
-    GDK_BACKEND=x11 dbus-run-session -- xvfb-run -a \
-        "$prefix/bin/emacs" -l "$work/gui.el"
-fi
+xvfb-run -a "$prefix/bin/emacs" -l "$work/gui.el"
 
 printf 'Verified %s\n' "$archive"
