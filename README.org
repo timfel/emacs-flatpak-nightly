@@ -5,9 +5,9 @@
 * Objectives
 
 I want a portable Emacs package, built regularly from ~master~. I used to build
-Emacs locally on every machine I used and selected the features I want: a
-Lucid X11 GUI, native compilation, tree-sitter, ImageMagick, file
-notifications, sound, XPM, and the common image formats.
+Emacs locally on every machine I used and selected the features I want: a Lucid
+X11 GUI, native compilation, tree-sitter, ImageMagick, file notifications,
+sound, XPM, and the common image formats.
 
 I use immutable distributions, WSL2, and Linux on my Android phone through the
 Android Virtualization Framework, and I do not want to rebuild Emacs in all
@@ -414,10 +414,10 @@ EOF
 
 * Making the installation relocatable
 
-There is no wrapper around Emacs, every ELF file gets a RUNPATH relative to
-~$ORIGIN~, Emacs and its tools find ~lib/private~, while the compiler tools find
-their own library directory. This works without setting ~LD_LIBRARY_PATH~ for
-programs started from Emacs.
+Every ELF file gets a RUNPATH relative to ~$ORIGIN~.  The public ~emacs~ and
+~emacsclient~ wrappers set the runtime paths and exec real binaries, which find
+~lib/private~, while the compiler tools find their own library directory. This
+works without setting ~LD_LIBRARY_PATH~ for programs started from Emacs.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
 printf 'Patching ELF RUNPATHs and packaging archive...\n'
@@ -499,15 +499,28 @@ final_prefix="$BUILD_DIR/package/$PACKAGE_NAME"
 cp -a "$PREFIX_DIR/usr"/. "$final_prefix/"
 #+end_src
 
-The result still uses the normal Emacs binary, and the ~environment.sh~ file
-sets the paths for Lisp, data, helper programs, native Lisp, and ImageMagick. It
-also adds the archive's normal ~bin~ directory to ~PATH~, but does not add the
-private compiler directory.
+The installed executables are renamed, and small wrappers with their public
+names set the relocatable Emacs and ImageMagick variables before using ~exec~.
+This keeps relocation automatic without requiring a shell file to be sourced;
+the wrapper adds only the archive's normal ~bin~ directory to ~PATH~.  The
+private compiler directory is still added only while native-compilation workers
+are created.
 
 #+begin_src bash :tangle build-bundle.sh :tangle-mode (identity #o755)
-cat >"$final_prefix/environment.sh" <<EOF
-_emacs_prefix=\$(CDPATH= cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)
-export PATH="\$_emacs_prefix/bin:\$PATH"
+emacs_binary=$(readlink -f "$final_prefix/bin/emacs")
+emacsclient_binary=$(readlink -f "$final_prefix/bin/emacsclient")
+mv "$emacs_binary" "$final_prefix/bin/emacs.real"
+rm -f "$final_prefix/bin/emacs"
+mv "$emacsclient_binary" "$final_prefix/bin/emacsclient.real"
+
+write_wrapper() {
+    local name=$1 target=$2
+    cat >"$final_prefix/bin/$name" <<EOF
+#!/bin/sh
+set -eu
+_emacs_executable=\$(readlink -f -- "\$0")
+_emacs_prefix=\$(CDPATH= cd -- "\$(dirname -- "\$_emacs_executable")/.." && pwd)
+export PATH="\$_emacs_prefix/bin\${PATH:+:\$PATH}"
 export MAGICK_HOME="\$_emacs_prefix"
 export MAGICK_CONFIGURE_PATH="\$_emacs_prefix/lib/ImageMagick/config:\$_emacs_prefix/etc/ImageMagick-6:\$_emacs_prefix/share/ImageMagick-6"
 export MAGICK_CODER_MODULE_PATH="\$_emacs_prefix/lib/ImageMagick/coders"
@@ -517,16 +530,19 @@ export EMACSDOC="\$_emacs_prefix/share/emacs/$EMACS_VERSION/etc"
 export EMACSPATH="\$_emacs_prefix/libexec/emacs/$EMACS_VERSION/$EMACS_ARCH"
 export EMACSLOADPATH="\$_emacs_prefix/share/emacs/site-lisp:\$_emacs_prefix/share/emacs/$EMACS_VERSION/lisp"
 export EMACSNATIVELOADPATH="\$_emacs_prefix/lib/emacs/$EMACS_VERSION/native-lisp"
-unset _emacs_prefix
+exec "\$_emacs_prefix/bin/$target" "\$@"
 EOF
+    chmod 755 "$final_prefix/bin/$name"
+}
+write_wrapper emacs emacs.real
+write_wrapper emacsclient emacsclient.real
 
 dump_files=("$final_prefix/libexec/emacs/$EMACS_VERSION/$EMACS_ARCH"/*.pdmp)
 if ((${#dump_files[@]} != 1)); then
     printf 'Expected one portable dump, found %d\n' "${#dump_files[@]}" >&2
     exit 1
 fi
-emacs_binary=$(readlink -f "$final_prefix/bin/emacs")
-dump_link="$final_prefix/bin/${emacs_binary##*/}.pdmp"
+dump_link="$final_prefix/bin/emacs.real.pdmp"
 dump_target="../libexec/emacs/$EMACS_VERSION/$EMACS_ARCH/${dump_files[0]##*/}"
 ln -s "$dump_target" "$dump_link"
 
@@ -575,14 +591,14 @@ sha256sum --check dist/Emacs-*.tar.zst.sha256
 mkdir -p "$HOME/.local/opt"
 tar --zstd -xf dist/Emacs-*.tar.zst -C "$HOME/.local/opt"
 prefix=$(find "$HOME/.local/opt" -maxdepth 1 -type d -name 'Emacs-*' -print -quit)
-. "$prefix/environment.sh"
+export PATH="$prefix/bin:$PATH"
 emacs
 #+end_src
 
-Source ~environment.sh~ from the shell or session that starts Emacs, it sets
-Emacs installation paths, prepends the normal ~bin~ directory, and exports the
-bundled ImageMagick paths, while the private native-comp tool directory is only
-added when compilation workers are started.
+The ~emacs~ and ~emacsclient~ commands are wrappers.  They set the relocation,
+Lisp, and ImageMagick paths and then exec the renamed real binaries; no shell
+file needs to be sourced.  They do not add the private native-comp tool
+directory to ~PATH~ except for the scoped worker setup in the site file.
 
 The host must provide glibc 2.36 or newer and an X server, but no host GUI
 library, GCC, libgccjit, binutils, or development package is required.

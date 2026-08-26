@@ -30,9 +30,11 @@ printf 'host-gcc\n'
 EOF
 chmod +x "$work/host-bin/gcc"
 export HOME="$work/home"
-export PATH="$work/host-bin:/usr/local/bin:/usr/bin:/bin"
-# shellcheck source=/dev/null
-source "$prefix/environment.sh"
+export PATH="$prefix/bin:$work/host-bin:/usr/local/bin:/usr/bin:/bin"
+[[ ! -e $prefix/environment.sh ]] || {
+    echo 'The prefix unexpectedly contains environment.sh' >&2
+    exit 1
+}
 
 private_lib="$prefix/lib/private"
 toolchain="$prefix/libexec/native-comp"
@@ -91,8 +93,8 @@ while IFS= read -r -d '' elf; do
 done < <(find "$prefix" -type f -print0)
 
 for forbidden in LD_LIBRARY_PATH GCC_EXEC_PREFIX COMPILER_PATH LIBRARY_PATH; do
-    if grep -R -n --include='environment.sh' --include='site-start.el' \
-            "$forbidden" "$prefix"; then
+    if grep -R -n --include='emacs' --include='emacsclient' \
+            --include='site-start.el' "$forbidden" "$prefix"; then
         printf 'Forbidden environment mechanism appears in the prefix: %s\n' "$forbidden" >&2
         exit 1
     fi
